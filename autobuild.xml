@@ -81,9 +81,7 @@
           <key>manifest</key>
           <array>
             <string>lib/debug/*.so*</string>
-            <string>lib/debug/pkgconfig/*</string>
             <string>lib/release/*.so*</string>
-            <string>lib/release/pkgconfig/*</string>
           </array>
           <key>name</key>
           <string>linux</string>
