@@ -311,3 +311,4 @@ popd
 
 mkdir -p "$stage/LICENSES"
 cp "$top/openal-soft/COPYING" "$stage/LICENSES/openal-soft.txt"
+cp "$top/freealut/COPYING" "$stage/LICENSES/freealut.txt"
