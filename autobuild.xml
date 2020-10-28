@@ -42,6 +42,7 @@
           </map>
           <key>manifest</key>
           <array>
+            <string>LICENSES/freealut.txt</string>
             <string>LICENSES/openal-soft.txt</string>
             <string>include/AL/*.h</string>
           </array>
@@ -100,10 +101,10 @@
           </map>
           <key>manifest</key>
           <array>
-            <string>lib/debug/OpenAL32.lib</string>
-            <string>lib/debug/OpenAL32.dll</string>
-            <string>lib/release/OpenAL32.lib</string>
-            <string>lib/release/OpenAL32.dll</string>
+            <string>lib/debug/OpenAL32.*</string>
+            <string>lib/debug/alut.*</string>
+            <string>lib/release/OpenAL32.*</string>
+            <string>lib/release/alut.*</string>
           </array>
           <key>name</key>
           <string>windows</string>
