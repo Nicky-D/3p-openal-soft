@@ -1,0 +1,3 @@
+include:
+  - project: 'alchemy/infrastructure/gitlab-ci-config'
+    file: '3p-library.yml'
