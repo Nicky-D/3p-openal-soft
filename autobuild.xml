@@ -63,6 +63,8 @@
           </map>
           <key>manifest</key>
           <array>
+            <string>lib/debug/*.dylib*</string>
+            <string>lib/release/*.dylib*</string>
           </array>
           <key>name</key>
           <string>darwin</string>
