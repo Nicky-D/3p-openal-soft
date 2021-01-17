@@ -4,6 +4,8 @@
 #include "AL/al.h"
 #include "AL/alc.h"
 
+#include "almalloc.h"
+
 struct EffectState;
 
 
@@ -14,10 +16,7 @@ enum {
     /* User event types. */
     EventType_SourceStateChange = 1<<0,
     EventType_BufferCompleted   = 1<<1,
-    EventType_Error             = 1<<2,
-    EventType_Performance       = 1<<3,
-    EventType_Deprecated        = 1<<4,
-    EventType_Disconnected      = 1<<5,
+    EventType_Disconnected      = 1<<2,
 
     /* Internal events. */
     EventType_ReleaseEffectState = 65536,
@@ -46,6 +45,8 @@ struct AsyncEvent {
 
     AsyncEvent() noexcept = default;
     constexpr AsyncEvent(unsigned int type) noexcept : EnumType{type} { }
+
+    DISABLE_ALLOC()
 };
 
 

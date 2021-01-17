@@ -122,7 +122,7 @@ void StopEventThrd(ALCcontext *ctx)
             evt_data = ring->getWriteVector().first;
         } while(evt_data.len == 0);
     }
-    new (evt_data.buf) AsyncEvent{EventType_KillThread};
+    ::new(evt_data.buf) AsyncEvent{EventType_KillThread};
     ring->writeAdvance(1);
 
     ctx->mEventSem.post();
@@ -149,12 +149,6 @@ START_API_FUNC
                 flags |= EventType_BufferCompleted;
             else if(type == AL_EVENT_TYPE_SOURCE_STATE_CHANGED_SOFT)
                 flags |= EventType_SourceStateChange;
-            else if(type == AL_EVENT_TYPE_ERROR_SOFT)
-                flags |= EventType_Error;
-            else if(type == AL_EVENT_TYPE_PERFORMANCE_SOFT)
-                flags |= EventType_Performance;
-            else if(type == AL_EVENT_TYPE_DEPRECATED_SOFT)
-                flags |= EventType_Deprecated;
             else if(type == AL_EVENT_TYPE_DISCONNECTED_SOFT)
                 flags |= EventType_Disconnected;
             else

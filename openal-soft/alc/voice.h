@@ -7,8 +7,10 @@
 #include "AL/alext.h"
 
 #include "al/buffer.h"
+#include "almalloc.h"
 #include "alspan.h"
 #include "alu.h"
+#include "buffer_storage.h"
 #include "devformat.h"
 #include "filters/biquad.h"
 #include "filters/nfc.h"
@@ -18,10 +20,10 @@
 enum class DistanceModel;
 
 
-enum SpatializeMode {
-    SpatializeOff = AL_FALSE,
-    SpatializeOn = AL_TRUE,
-    SpatializeAuto = AL_AUTO_SOFT
+enum class SpatializeMode : unsigned char {
+    Off = AL_FALSE,
+    On = AL_TRUE,
+    Auto = AL_AUTO_SOFT
 };
 
 enum class DirectMode : unsigned char {
@@ -43,16 +45,9 @@ enum class Resampler {
 };
 extern Resampler ResamplerDefault;
 
-/* The number of distinct scale and phase intervals within the bsinc filter
- * table.
- */
-#define BSINC_SCALE_BITS  4
-#define BSINC_SCALE_COUNT (1<<BSINC_SCALE_BITS)
-#define BSINC_PHASE_BITS  5
-#define BSINC_PHASE_COUNT (1<<BSINC_PHASE_BITS)
 
-/* Interpolator state.  Kind of a misnomer since the interpolator itself is
- * stateless.  This just keeps it from having to recompute scale-related
+/* Interpolator state. Kind of a misnomer since the interpolator itself is
+ * stateless. This just keeps it from having to recompute scale-related
  * mappings for every sample.
  */
 struct BsincState {
@@ -86,7 +81,7 @@ enum {
 
 struct MixHrtfFilter {
     const HrirArray *Coeffs;
-    ALuint Delay[2];
+    std::array<ALuint,2> Delay;
     float Gain;
     float GainStep;
 };
@@ -121,7 +116,7 @@ struct SendParams {
 };
 
 
-struct ALvoicePropsBase {
+struct VoiceProps {
     float Pitch;
     float Gain;
     float OuterGain;
@@ -174,31 +169,35 @@ struct ALvoicePropsBase {
     } Send[MAX_SENDS];
 };
 
-struct ALvoiceProps : public ALvoicePropsBase {
-    std::atomic<ALvoiceProps*> next{nullptr};
+struct VoicePropsItem : public VoiceProps {
+    std::atomic<VoicePropsItem*> next{nullptr};
 
-    DEF_NEWDEL(ALvoiceProps)
+    DEF_NEWDEL(VoicePropsItem)
 };
 
-#define VOICE_IS_STATIC    (1u<<0)
-#define VOICE_IS_FADING    (1u<<1) /* Fading sources use gain stepping for smooth transitions. */
-#define VOICE_IS_AMBISONIC (1u<<2) /* Voice needs HF scaling for ambisonic upsampling. */
-#define VOICE_HAS_HRTF     (1u<<3)
-#define VOICE_HAS_NFC      (1u<<4)
+constexpr ALuint VoiceIsStatic{       1u<<0};
+constexpr ALuint VoiceIsCallback{     1u<<1};
+constexpr ALuint VoiceIsAmbisonic{    1u<<2}; /* Needs HF scaling for ambisonic upsampling. */
+constexpr ALuint VoiceCallbackStopped{1u<<3};
+constexpr ALuint VoiceIsFading{       1u<<4}; /* Use gain stepping for smooth transitions. */
+constexpr ALuint VoiceHasHrtf{        1u<<5};
+constexpr ALuint VoiceHasNfc{         1u<<6};
 
-struct ALvoice {
+struct Voice {
     enum State {
-        Stopped = 0,
-        Playing = 1,
-        Stopping = 2
+        Stopped,
+        Playing,
+        Stopping,
+        Pending
     };
 
-    std::atomic<ALvoiceProps*> mUpdate{nullptr};
+    std::atomic<VoicePropsItem*> mUpdate{nullptr};
+
+    VoiceProps mProps;
 
     std::atomic<ALuint> mSourceID{0u};
     std::atomic<State> mPlayState{Stopped};
-
-    ALvoicePropsBase mProps;
+    std::atomic<bool> mPendingChange{false};
 
     /**
      * Source offset in samples, relative to the currently playing buffer, NOT
@@ -219,20 +218,20 @@ struct ALvoice {
     /* Properties for the attached buffer(s). */
     FmtChannels mFmtChannels;
     ALuint mFrequency;
-    ALuint mNumChannels;
     ALuint mSampleSize;
     AmbiLayout mAmbiLayout;
-    AmbiNorm mAmbiScaling;
+    AmbiScaling mAmbiScaling;
     ALuint mAmbiOrder;
 
     /** Current target parameters used for mixing. */
-    ALuint mStep;
+    ALuint mStep{0};
 
     ResamplerFunc mResampler;
 
     InterpState mResampleState;
 
-    ALuint mFlags;
+    ALuint mFlags{};
+    ALuint mNumCallbackSamples{0};
 
     struct TargetData {
         int FilterType;
@@ -250,57 +249,16 @@ struct ALvoice {
         DirectParams mDryParams;
         std::array<SendParams,MAX_SENDS> mWetParams;
     };
-    std::array<ChannelData,MAX_INPUT_CHANNELS> mChans;
+    al::vector<ChannelData> mChans{2};
 
-    ALvoice() = default;
-    ALvoice(const ALvoice&) = delete;
-    ALvoice(ALvoice&& rhs) noexcept { *this = std::move(rhs); }
-    ~ALvoice() { delete mUpdate.exchange(nullptr, std::memory_order_acq_rel); }
-    ALvoice& operator=(const ALvoice&) = delete;
-    ALvoice& operator=(ALvoice&& rhs) noexcept
-    {
-        ALvoiceProps *old_update{mUpdate.load(std::memory_order_relaxed)};
-        mUpdate.store(rhs.mUpdate.exchange(old_update, std::memory_order_relaxed),
-            std::memory_order_relaxed);
-
-        mSourceID.store(rhs.mSourceID.load(std::memory_order_relaxed), std::memory_order_relaxed);
-        mPlayState.store(rhs.mPlayState.load(std::memory_order_relaxed),
-            std::memory_order_relaxed);
-
-        mProps = rhs.mProps;
-
-        mPosition.store(rhs.mPosition.load(std::memory_order_relaxed), std::memory_order_relaxed);
-        mPositionFrac.store(rhs.mPositionFrac.load(std::memory_order_relaxed),
-            std::memory_order_relaxed);
-
-        mCurrentBuffer.store(rhs.mCurrentBuffer.load(std::memory_order_relaxed),
-            std::memory_order_relaxed);
-        mLoopBuffer.store(rhs.mLoopBuffer.load(std::memory_order_relaxed),
-            std::memory_order_relaxed);
-
-        mFmtChannels = rhs.mFmtChannels;
-        mFrequency = rhs.mFrequency;
-        mNumChannels = rhs.mNumChannels;
-        mSampleSize = rhs.mSampleSize;
-        mAmbiLayout = rhs.mAmbiLayout;
-        mAmbiScaling = rhs.mAmbiScaling;
-        mAmbiOrder = rhs.mAmbiOrder;
-
-        mStep = rhs.mStep;
-        mResampler = rhs.mResampler;
-
-        mResampleState = rhs.mResampleState;
-
-        mFlags = rhs.mFlags;
-
-        mDirect = rhs.mDirect;
-        mSend = rhs.mSend;
-        mChans = rhs.mChans;
-
-        return *this;
-    }
+    Voice() = default;
+    Voice(const Voice&) = delete;
+    ~Voice() { delete mUpdate.exchange(nullptr, std::memory_order_acq_rel); }
+    Voice& operator=(const Voice&) = delete;
 
     void mix(const State vstate, ALCcontext *Context, const ALuint SamplesToDo);
+
+    DEF_NEWDEL(Voice)
 };
 
 #endif /* VOICE_H */

@@ -99,7 +99,7 @@ struct WaveBackend final : public BackendBase {
 
     void open(const ALCchar *name) override;
     bool reset() override;
-    bool start() override;
+    void start() override;
     void stop() override;
 
     FILE *mFile{nullptr};
@@ -146,13 +146,10 @@ int WaveBackend::mixerProc()
         }
         while(avail-done >= mDevice->UpdateSize)
         {
-            {
-                std::lock_guard<WaveBackend> _{*this};
-                aluMixData(mDevice, mBuffer.data(), mDevice->UpdateSize, frameStep);
-            }
+            mDevice->renderSamples(mBuffer.data(), mDevice->UpdateSize, frameStep);
             done += mDevice->UpdateSize;
 
-            if(!IS_LITTLE_ENDIAN)
+            if /*constexpr*/(!IS_LITTLE_ENDIAN)
             {
                 const ALuint bytesize{mDevice->bytesFromFmt()};
 
@@ -184,7 +181,7 @@ int WaveBackend::mixerProc()
             if(ferror(mFile))
             {
                 ERR("Error writing to file\n");
-                aluHandleDisconnect(mDevice, "Failed to write playback samples");
+                mDevice->handleDisconnect("Failed to write playback samples");
                 break;
             }
         }
@@ -274,8 +271,8 @@ bool WaveBackend::reset()
         case DevFmtAmbi3D:
             /* .amb output requires FuMa */
             mDevice->mAmbiOrder = minu(mDevice->mAmbiOrder, 3);
-            mDevice->mAmbiLayout = AmbiLayout::FuMa;
-            mDevice->mAmbiScale = AmbiNorm::FuMa;
+            mDevice->mAmbiLayout = DevAmbiLayout::FuMa;
+            mDevice->mAmbiScale = DevAmbiScaling::FuMa;
             isbformat = 1;
             chanmask = 0;
             break;
@@ -327,7 +324,7 @@ bool WaveBackend::reset()
     }
     mDataStart = ftell(mFile);
 
-    SetDefaultWFXChannelOrder(mDevice);
+    setDefaultWFXChannelOrder();
 
     const ALuint bufsize{mDevice->frameSizeFromFmt() * mDevice->UpdateSize};
     mBuffer.resize(bufsize);
@@ -335,19 +332,16 @@ bool WaveBackend::reset()
     return true;
 }
 
-bool WaveBackend::start()
+void WaveBackend::start()
 {
     try {
         mKillNow.store(false, std::memory_order_release);
         mThread = std::thread{std::mem_fn(&WaveBackend::mixerProc), this};
-        return true;
     }
     catch(std::exception& e) {
-        ERR("Failed to start mixing thread: %s\n", e.what());
+        throw al::backend_exception{ALC_INVALID_DEVICE, "Failed to start mixing thread: %s",
+            e.what()};
     }
-    catch(...) {
-    }
-    return false;
 }
 
 void WaveBackend::stop()
@@ -376,17 +370,19 @@ bool WaveBackendFactory::init()
 bool WaveBackendFactory::querySupport(BackendType type)
 { return type == BackendType::Playback; }
 
-void WaveBackendFactory::probe(DevProbe type, std::string *outnames)
+std::string WaveBackendFactory::probe(BackendType type)
 {
+    std::string outnames;
     switch(type)
     {
-        case DevProbe::Playback:
-            /* Includes null char. */
-            outnames->append(waveDevice, sizeof(waveDevice));
-            break;
-        case DevProbe::Capture:
-            break;
+    case BackendType::Playback:
+        /* Includes null char. */
+        outnames.append(waveDevice, sizeof(waveDevice));
+        break;
+    case BackendType::Capture:
+        break;
     }
+    return outnames;
 }
 
 BackendPtr WaveBackendFactory::createBackend(ALCdevice *device, BackendType type)

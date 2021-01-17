@@ -10,6 +10,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 
 #include "AL/al.h"
@@ -22,6 +23,7 @@
 #include "alspan.h"
 #include "ambidefs.h"
 #include "atomic.h"
+#include "bufferline.h"
 #include "devformat.h"
 #include "filters/splitter.h"
 #include "hrtf.h"
@@ -41,22 +43,24 @@ struct bs2b;
 
 
 #define MIN_OUTPUT_RATE      8000
+#define MAX_OUTPUT_RATE      192000
 #define DEFAULT_OUTPUT_RATE  44100
+
 #define DEFAULT_UPDATE_SIZE  882 /* 20ms */
 #define DEFAULT_NUM_UPDATES  3
 
 
-enum DeviceType {
+enum class DeviceType {
     Playback,
     Capture,
     Loopback
 };
 
 
-enum RenderMode {
-    NormalRender,
-    StereoPair,
-    HrtfRender
+enum class RenderMode {
+    Normal,
+    Pairwise,
+    Hrtf
 };
 
 
@@ -120,68 +124,41 @@ struct FilterSubList {
 class DistanceComp {
 public:
     struct DistData {
-        ALfloat Gain{1.0f};
+        float Gain{1.0f};
         ALuint Length{0u}; /* Valid range is [0...MAX_DELAY_LENGTH). */
-        ALfloat *Buffer{nullptr};
+        float *Buffer{nullptr};
     };
 
 private:
+    using FloatArray = al::FlexArray<float,16>;
     std::array<DistData,MAX_OUTPUT_CHANNELS> mChannels;
-    al::vector<ALfloat,16> mSamples;
+    std::unique_ptr<FloatArray> mSamples;
 
 public:
-    void setSampleCount(size_t new_size) { mSamples.resize(new_size); }
+    void setSampleCount(size_t new_size)
+    { mSamples = FloatArray::Create(new_size); }
     void clear() noexcept
     {
-        for(auto &chan : mChannels)
-        {
-            chan.Gain = 1.0f;
-            chan.Length = 0;
-            chan.Buffer = nullptr;
-        }
-        using SampleVecT = decltype(mSamples);
-        SampleVecT{}.swap(mSamples);
+        mChannels.fill(DistData{});
+        mSamples = nullptr;
     }
 
-    ALfloat *getSamples() noexcept { return mSamples.data(); }
+    float *getSamples() noexcept { return mSamples->data(); }
 
     al::span<DistData,MAX_OUTPUT_CHANNELS> as_span() { return mChannels; }
 };
 
+
 struct BFChannelConfig {
-    ALfloat Scale;
+    float Scale;
     ALuint Index;
 };
-
-/* Size for temporary storage of buffer data, in ALfloats. Larger values need
- * more memory, while smaller values may need more iterations. The value needs
- * to be a sensible size, however, as it constrains the max stepping value used
- * for mixing, as well as the maximum number of samples per mixing iteration.
- */
-#define BUFFERSIZE 1024
-
-using FloatBufferLine = std::array<float,BUFFERSIZE>;
 
 /* Maximum number of samples to pad on the ends of a buffer for resampling.
  * Note that the padding is symmetric (half at the beginning and half at the
  * end)!
  */
 #define MAX_RESAMPLER_PADDING 48
-
-
-struct FrontStablizer {
-    static constexpr size_t DelayLength{256u};
-
-    alignas(16) float DelayBuf[MAX_OUTPUT_CHANNELS][DelayLength];
-
-    BandSplitter LFilter, RFilter;
-    alignas(16) float LSplit[2][BUFFERSIZE];
-    alignas(16) float RSplit[2][BUFFERSIZE];
-
-    alignas(16) float TempBuf[BUFFERSIZE + DelayLength];
-
-    DEF_NEWDEL(FrontStablizer)
-};
 
 
 struct MixParams {
@@ -224,13 +201,13 @@ struct ALCdevice : public al::intrusive_ref<ALCdevice> {
 
     DevFmtChannels FmtChans{};
     DevFmtType FmtType{};
-    ALboolean IsHeadphones{AL_FALSE};
+    bool IsHeadphones{false};
     ALuint mAmbiOrder{0};
     /* For DevFmtAmbi* output only, specifies the channel order and
      * normalization.
      */
-    AmbiLayout mAmbiLayout{AmbiLayout::Default};
-    AmbiNorm   mAmbiScale{AmbiNorm::Default};
+    DevAmbiLayout mAmbiLayout{DevAmbiLayout::Default};
+    DevAmbiScaling mAmbiScale{DevAmbiScaling::Default};
 
     ALCenum LimiterState{ALC_DONT_CARE_SOFT};
 
@@ -267,28 +244,28 @@ struct ALCdevice : public al::intrusive_ref<ALCdevice> {
     al::vector<FilterSubList> FilterList;
 
     /* Rendering mode. */
-    RenderMode mRenderMode{NormalRender};
+    RenderMode mRenderMode{RenderMode::Normal};
 
     /* The average speaker distance as determined by the ambdec configuration,
      * HRTF data set, or the NFC-HOA reference delay. Only used for NFC.
      */
-    ALfloat AvgSpeakerDist{0.0f};
+    float AvgSpeakerDist{0.0f};
 
     ALuint SamplesDone{0u};
     std::chrono::nanoseconds ClockBase{0};
     std::chrono::nanoseconds FixedLatency{0};
 
     /* Temp storage used for mixer processing. */
-    alignas(16) ALfloat SourceData[BUFFERSIZE + MAX_RESAMPLER_PADDING];
-    alignas(16) ALfloat ResampledData[BUFFERSIZE];
-    alignas(16) ALfloat FilteredData[BUFFERSIZE];
+    alignas(16) float SourceData[BUFFERSIZE + MAX_RESAMPLER_PADDING];
+    alignas(16) float ResampledData[BUFFERSIZE];
+    alignas(16) float FilteredData[BUFFERSIZE];
     union {
-        alignas(16) ALfloat HrtfSourceData[BUFFERSIZE + HRTF_HISTORY_LENGTH];
-        alignas(16) ALfloat NfcSampleData[BUFFERSIZE];
+        alignas(16) float HrtfSourceData[BUFFERSIZE + HRTF_HISTORY_LENGTH];
+        alignas(16) float NfcSampleData[BUFFERSIZE];
     };
 
     /* Persistent storage for HRTF mixing. */
-    alignas(16) float2 HrtfAccumData[BUFFERSIZE + HRIR_LENGTH];
+    alignas(16) float2 HrtfAccumData[BUFFERSIZE + HRIR_LENGTH + HRTF_DIRECT_DELAY];
 
     /* Mixing buffer used by the Dry mix and Real output. */
     al::vector<FloatBufferLine, 16> MixBuffer;
@@ -304,7 +281,7 @@ struct ALCdevice : public al::intrusive_ref<ALCdevice> {
 
     /* HRTF state and info */
     std::unique_ptr<DirectHrtfState> mHrtfState;
-    HrtfStore *mHrtf{nullptr};
+    al::intrusive_ptr<HrtfStore> mHrtf;
 
     /* Ambisonic-to-UHJ encoder */
     std::unique_ptr<Uhj2Encoder> Uhj_Encoder;
@@ -318,15 +295,13 @@ struct ALCdevice : public al::intrusive_ref<ALCdevice> {
     using PostProc = void(ALCdevice::*)(const size_t SamplesToDo);
     PostProc PostProcess{nullptr};
 
-    std::unique_ptr<FrontStablizer> Stablizer;
-
     std::unique_ptr<Compressor> Limiter;
 
     /* Delay buffers used to compensate for speaker distances. */
     DistanceComp ChannelDelay;
 
     /* Dithering control. */
-    ALfloat DitherDepth{0.0f};
+    float DitherDepth{0.0f};
     ALuint DitherSeed{0u};
 
     /* Running count of the mixer invocations, in 31.1 fixed point. This
@@ -356,13 +331,27 @@ struct ALCdevice : public al::intrusive_ref<ALCdevice> {
     ALuint channelsFromFmt() const noexcept { return ChannelsFromDevFmt(FmtChans, mAmbiOrder); }
     ALuint frameSizeFromFmt() const noexcept { return bytesFromFmt() * channelsFromFmt(); }
 
+    ALuint waitForMix() const noexcept
+    {
+        ALuint refcount;
+        while((refcount=MixCount.load(std::memory_order_acquire))&1) {
+        }
+        return refcount;
+    }
+
     void ProcessHrtf(const size_t SamplesToDo);
     void ProcessAmbiDec(const size_t SamplesToDo);
+    void ProcessAmbiDecStablized(const size_t SamplesToDo);
     void ProcessUhj(const size_t SamplesToDo);
     void ProcessBs2b(const size_t SamplesToDo);
 
     inline void postProcess(const size_t SamplesToDo)
     { if LIKELY(PostProcess) (this->*PostProcess)(SamplesToDo); }
+
+    void renderSamples(void *outBuffer, const ALuint numSamples, const size_t frameStep);
+
+    /* Caller must lock the device state, and the mixer must not be running. */
+    [[gnu::format(printf,2,3)]] void handleDisconnect(const char *msg, ...);
 
     DEF_NEWDEL(ALCdevice)
 };
@@ -374,18 +363,13 @@ struct ALCdevice : public al::intrusive_ref<ALCdevice> {
 #define RECORD_THREAD_NAME "alsoft-record"
 
 
-extern ALint RTPrioLevel;
+extern int RTPrioLevel;
 void SetRTPriority(void);
-
-void SetDefaultChannelOrder(ALCdevice *device);
-void SetDefaultWFXChannelOrder(ALCdevice *device);
 
 const ALCchar *DevFmtTypeString(DevFmtType type) noexcept;
 const ALCchar *DevFmtChannelsString(DevFmtChannels chans) noexcept;
 
 /**
- * GetChannelIdxByName
- *
  * Returns the index for the given channel name (e.g. FrontCenter), or
  * INVALID_CHANNEL_INDEX if it doesn't exist.
  */

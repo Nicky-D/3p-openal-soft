@@ -13,10 +13,16 @@
 #include "pragmadefs.h"
 
 
-void *al_malloc(size_t alignment, size_t size);
-void *al_calloc(size_t alignment, size_t size);
+[[gnu::alloc_align(1), gnu::alloc_size(2)]] void *al_malloc(size_t alignment, size_t size);
+[[gnu::alloc_align(1), gnu::alloc_size(2)]] void *al_calloc(size_t alignment, size_t size);
 void al_free(void *ptr) noexcept;
 
+
+#define DISABLE_ALLOC()                                                       \
+    void *operator new(size_t) = delete;                                      \
+    void *operator new[](size_t) = delete;                                    \
+    void operator delete(void*) noexcept = delete;                            \
+    void operator delete[](void*) noexcept = delete;
 
 #define DEF_NEWDEL(T)                                                         \
     void *operator new(size_t size)                                           \
@@ -25,27 +31,37 @@ void al_free(void *ptr) noexcept;
         if(!ret) throw std::bad_alloc();                                      \
         return ret;                                                           \
     }                                                                         \
-    void operator delete(void *block) noexcept { al_free(block); }
+    void *operator new[](size_t size) { return operator new(size); }          \
+    void operator delete(void *block) noexcept { al_free(block); }            \
+    void operator delete[](void *block) noexcept { operator delete(block); }
 
 #define DEF_PLACE_NEWDEL()                                                    \
     void *operator new(size_t /*size*/, void *ptr) noexcept { return ptr; }   \
+    void *operator new[](size_t /*size*/, void *ptr) noexcept { return ptr; } \
     void operator delete(void *block, void*) noexcept { al_free(block); }     \
-    void operator delete(void *block) noexcept { al_free(block); }
+    void operator delete(void *block) noexcept { al_free(block); }            \
+    void operator delete[](void *block, void*) noexcept { al_free(block); }   \
+    void operator delete[](void *block) noexcept { al_free(block); }
 
-struct FamCount { size_t mCount; };
+enum FamCount : size_t { };
 
 #define DEF_FAM_NEWDEL(T, FamMem)                                             \
     static constexpr size_t Sizeof(size_t count) noexcept                     \
-    { return decltype(FamMem)::Sizeof(count, offsetof(T, FamMem)); }          \
-                                                                              \
-    void *operator new(size_t /*size*/, FamCount fam)                         \
     {                                                                         \
-        if(void *ret{al_malloc(alignof(T), T::Sizeof(fam.mCount))})           \
+        return std::max<size_t>(sizeof(T),                                    \
+            decltype(FamMem)::Sizeof(count, offsetof(T, FamMem)));            \
+    }                                                                         \
+                                                                              \
+    void *operator new(size_t /*size*/, FamCount count)                       \
+    {                                                                         \
+        if(void *ret{al_malloc(alignof(T), T::Sizeof(count))})                \
             return ret;                                                       \
         throw std::bad_alloc();                                               \
     }                                                                         \
+    void *operator new[](size_t /*size*/) = delete;                           \
     void operator delete(void *block, FamCount) { al_free(block); }           \
-    void operator delete(void *block) noexcept { al_free(block); }
+    void operator delete(void *block) noexcept { al_free(block); }            \
+    void operator delete[](void* /*block*/) = delete;
 
 
 namespace al {
@@ -68,11 +84,11 @@ struct allocator {
         using other = allocator<U, (alignment<alignof(U))?alignof(U):alignment>;
     };
 
-    allocator() = default;
+    allocator() noexcept = default;
     template<typename U, std::size_t N>
     constexpr allocator(const allocator<U,N>&) noexcept { }
 
-    T *allocate(std::size_t n)
+    [[gnu::assume_aligned(alignment), gnu::alloc_size(2)]] T *allocate(std::size_t n)
     {
         if(n > std::numeric_limits<std::size_t>::max()/sizeof(T)) throw std::bad_alloc();
         if(auto p = static_cast<T*>(al_malloc(alignment, n*sizeof(T)))) return p;
@@ -86,19 +102,7 @@ template<typename T, std::size_t N, typename U, std::size_t M>
 bool operator!=(const allocator<T,N>&, const allocator<U,M>&) noexcept { return false; }
 
 template<size_t alignment, typename T>
-inline T* assume_aligned(T *ptr) noexcept
-{
-    static_assert((alignment & (alignment-1)) == 0, "alignment must be a power of 2");
-#ifdef __GNUC__
-    return static_cast<T*>(__builtin_assume_aligned(ptr, alignment));
-#elif defined(_MSC_VER)
-    auto ptrval = reinterpret_cast<uintptr_t>(ptr);
-    if((ptrval&(alignment-1)) != 0) __assume(0);
-    return reinterpret_cast<T*>(ptrval);
-#else
-    return ptr;
-#endif
-}
+[[gnu::assume_aligned(alignment)]] inline T* assume_aligned(T *ptr) noexcept { return ptr; }
 
 /* At least VS 2015 complains that 'ptr' is unused when the given type's
  * destructor is trivial (a no-op). So disable that warning for this call.
@@ -133,24 +137,6 @@ inline T destroy_n(T first, N count)
 }
 
 
-template<typename T>
-inline void uninitialized_default_construct(T first, const T last)
-{
-    using ValueT = typename std::iterator_traits<T>::value_type;
-    T current{first};
-    try {
-        while(current != last)
-        {
-            ::new (static_cast<void*>(std::addressof(*current))) ValueT;
-            ++current;
-        }
-    }
-    catch(...) {
-        al::destroy(first, current);
-        throw;
-    }
-}
-
 template<typename T, typename N, REQUIRES(std::is_integral<N>::value)>
 inline T uninitialized_default_construct_n(T first, N count)
 {
@@ -160,7 +146,7 @@ inline T uninitialized_default_construct_n(T first, N count)
     {
         try {
             do {
-                ::new (static_cast<void*>(std::addressof(*current))) ValueT;
+                ::new(static_cast<void*>(std::addressof(*current))) ValueT;
                 ++current;
             } while(--count);
         }
@@ -173,57 +159,6 @@ inline T uninitialized_default_construct_n(T first, N count)
 }
 
 
-template<typename T0, typename T1>
-inline T1 uninitialized_move(T0 first, const T0 last, const T1 output)
-{
-    using ValueT = typename std::iterator_traits<T1>::value_type;
-    T1 current{output};
-    try {
-        while(first != last)
-        {
-            ::new (static_cast<void*>(std::addressof(*current))) ValueT{std::move(*first)};
-            ++current;
-            ++first;
-        }
-    }
-    catch(...) {
-        al::destroy(output, current);
-        throw;
-    }
-    return current;
-}
-
-template<typename T0, typename N, typename T1, REQUIRES(std::is_integral<N>::value)>
-inline T1 uninitialized_move_n(T0 first, N count, const T1 output)
-{
-    using ValueT = typename std::iterator_traits<T1>::value_type;
-    T1 current{output};
-    if(count != 0)
-    {
-        try {
-            do {
-                ::new (static_cast<void*>(std::addressof(*current))) ValueT{std::move(*first)};
-                ++current;
-                ++first;
-            } while(--count);
-        }
-        catch(...) {
-            al::destroy(output, current);
-            throw;
-        }
-    }
-    return current;
-}
-
-
-/* std::make_unique was added with C++14, so until we rely on that, make our
- * own version.
- */
-template<typename T, typename ...ArgsT>
-std::unique_ptr<T> make_unique(ArgsT&&...args)
-{ return std::unique_ptr<T>{new T{std::forward<ArgsT>(args)...}}; }
-
-
 /* A flexible array type. Used either standalone or at the end of a parent
  * struct, with placement new, to have a run-time-sized array that's embedded
  * with its size.
@@ -231,7 +166,7 @@ std::unique_ptr<T> make_unique(ArgsT&&...args)
 template<typename T, size_t alignment=alignof(T)>
 struct FlexArray {
     using element_type = T;
-    using value_type = typename std::remove_cv<T>::type;
+    using value_type = std::remove_cv_t<T>;
     using index_type = size_t;
     using difference_type = ptrdiff_t;
 
@@ -247,16 +182,15 @@ struct FlexArray {
 
 
     const index_type mSize;
-DIAGNOSTIC_PUSH
-std_pragma("GCC diagnostic ignored \"-Wpedantic\"")
-msc_pragma(warning(disable : 4200))
-    alignas(alignment) element_type mArray[0];
-DIAGNOSTIC_POP
+    union {
+        char mDummy;
+        alignas(alignment) element_type mArray[1];
+    };
 
     static std::unique_ptr<FlexArray> Create(index_type count)
     {
         void *ptr{al_calloc(alignof(FlexArray), Sizeof(count))};
-        return std::unique_ptr<FlexArray>{new (ptr) FlexArray{count}};
+        return std::unique_ptr<FlexArray>{new(ptr) FlexArray{count}};
     }
     static constexpr index_type Sizeof(index_type count, index_type base=0u) noexcept
     {

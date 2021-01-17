@@ -8,83 +8,51 @@
 #include "albyte.h"
 #include "almalloc.h"
 #include "atomic.h"
+#include "buffer_storage.h"
 #include "inprogext.h"
 #include "vector.h"
 
 
 /* User formats */
 enum UserFmtType : unsigned char {
-    UserFmtUByte,
-    UserFmtShort,
-    UserFmtFloat,
-    UserFmtDouble,
-    UserFmtMulaw,
-    UserFmtAlaw,
-    UserFmtIMA4,
+    UserFmtUByte = FmtUByte,
+    UserFmtShort = FmtShort,
+    UserFmtFloat = FmtFloat,
+    UserFmtMulaw = FmtMulaw,
+    UserFmtAlaw = FmtAlaw,
+    UserFmtDouble = FmtDouble,
+
+    UserFmtIMA4 = 128,
     UserFmtMSADPCM,
 };
 enum UserFmtChannels : unsigned char {
-    UserFmtMono,
-    UserFmtStereo,
-    UserFmtRear,
-    UserFmtQuad,
-    UserFmtX51, /* (WFX order) */
-    UserFmtX61, /* (WFX order) */
-    UserFmtX71, /* (WFX order) */
-    UserFmtBFormat2D, /* WXY */
-    UserFmtBFormat3D, /* WXYZ */
+    UserFmtMono = FmtMono,
+    UserFmtStereo = FmtStereo,
+    UserFmtRear = FmtRear,
+    UserFmtQuad = FmtQuad,
+    UserFmtX51 = FmtX51,
+    UserFmtX61 = FmtX61,
+    UserFmtX71 = FmtX71,
+    UserFmtBFormat2D = FmtBFormat2D,
+    UserFmtBFormat3D = FmtBFormat3D,
 };
-
-
-/* Storable formats */
-enum FmtType : unsigned char {
-    FmtUByte  = UserFmtUByte,
-    FmtShort  = UserFmtShort,
-    FmtFloat  = UserFmtFloat,
-    FmtDouble = UserFmtDouble,
-    FmtMulaw  = UserFmtMulaw,
-    FmtAlaw   = UserFmtAlaw,
-};
-enum FmtChannels : unsigned char {
-    FmtMono   = UserFmtMono,
-    FmtStereo = UserFmtStereo,
-    FmtRear   = UserFmtRear,
-    FmtQuad   = UserFmtQuad,
-    FmtX51    = UserFmtX51,
-    FmtX61    = UserFmtX61,
-    FmtX71    = UserFmtX71,
-    FmtBFormat2D = UserFmtBFormat2D,
-    FmtBFormat3D = UserFmtBFormat3D,
-};
-#define MAX_INPUT_CHANNELS  (8)
-
-
-ALuint BytesFromFmt(FmtType type) noexcept;
-ALuint ChannelsFromFmt(FmtChannels chans) noexcept;
 
 
 struct ALbuffer {
-    al::vector<al::byte,16> mData;
+    BufferStorage mBuffer;
 
-    ALuint Frequency{0u};
     ALbitfieldSOFT Access{0u};
-    ALuint SampleLen{0u};
-
-    FmtChannels mFmtChannels{};
-    FmtType     mFmtType{};
 
     UserFmtType OriginalType{};
     ALuint OriginalSize{0};
     ALuint OriginalAlign{0};
-
-    ALenum AmbiLayout{AL_FUMA_SOFT};
-    ALenum AmbiScaling{AL_FUMA_SOFT};
 
     ALuint LoopStart{0u};
     ALuint LoopEnd{0u};
 
     ALuint UnpackAlign{0};
     ALuint PackAlign{0};
+    ALuint UnpackAmbiOrder{1};
 
     ALbitfieldSOFT MappedAccess{0u};
     ALsizei MappedOffset{0};
@@ -96,9 +64,11 @@ struct ALbuffer {
     /* Self ID */
     ALuint id{0};
 
-    inline ALuint bytesFromFmt() const noexcept { return BytesFromFmt(mFmtType); }
-    inline ALuint channelsFromFmt() const noexcept { return ChannelsFromFmt(mFmtChannels); }
-    inline ALuint frameSizeFromFmt() const noexcept { return channelsFromFmt() * bytesFromFmt(); }
+    inline ALuint bytesFromFmt() const noexcept { return mBuffer.bytesFromFmt(); }
+    inline ALuint channelsFromFmt() const noexcept { return mBuffer.channelsFromFmt(); }
+    inline ALuint frameSizeFromFmt() const noexcept { return mBuffer.frameSizeFromFmt(); }
+
+    DISABLE_ALLOC()
 };
 
 #endif

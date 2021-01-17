@@ -33,7 +33,7 @@ struct LoopbackBackend final : public BackendBase {
 
     void open(const ALCchar *name) override;
     bool reset() override;
-    bool start() override;
+    void start() override;
     void stop() override;
 
     DEF_NEWDEL(LoopbackBackend)
@@ -47,12 +47,12 @@ void LoopbackBackend::open(const ALCchar *name)
 
 bool LoopbackBackend::reset()
 {
-    SetDefaultWFXChannelOrder(mDevice);
+    setDefaultWFXChannelOrder();
     return true;
 }
 
-bool LoopbackBackend::start()
-{ return true; }
+void LoopbackBackend::start()
+{ }
 
 void LoopbackBackend::stop()
 { }
@@ -66,8 +66,8 @@ bool LoopbackBackendFactory::init()
 bool LoopbackBackendFactory::querySupport(BackendType)
 { return true; }
 
-void LoopbackBackendFactory::probe(DevProbe, std::string*)
-{ }
+std::string LoopbackBackendFactory::probe(BackendType)
+{ return std::string{}; }
 
 BackendPtr LoopbackBackendFactory::createBackend(ALCdevice *device, BackendType)
 { return BackendPtr{new LoopbackBackend{device}}; }

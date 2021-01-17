@@ -58,10 +58,8 @@ struct Sdl2Backend final : public BackendBase {
 
     void open(const ALCchar *name) override;
     bool reset() override;
-    bool start() override;
+    void start() override;
     void stop() override;
-    void lock() override;
-    void unlock() override;
 
     SDL_AudioDeviceID mDeviceID{0u};
     ALuint mFrameSize{0};
@@ -85,7 +83,7 @@ void Sdl2Backend::audioCallback(Uint8 *stream, int len) noexcept
 {
     const auto ulen = static_cast<unsigned int>(len);
     assert((ulen % mFrameSize) == 0);
-    aluMixData(mDevice, stream, ulen / mFrameSize, mDevice->channelsFromFmt());
+    mDevice->renderSamples(stream, ulen / mFrameSize, mDevice->channelsFromFmt());
 }
 
 void Sdl2Backend::open(const ALCchar *name)
@@ -168,24 +166,15 @@ bool Sdl2Backend::reset()
     mDevice->FmtType = mFmtType;
     mDevice->UpdateSize = mUpdateSize;
     mDevice->BufferSize = mUpdateSize * 2;
-    SetDefaultWFXChannelOrder(mDevice);
+    setDefaultWFXChannelOrder();
     return true;
 }
 
-bool Sdl2Backend::start()
-{
-    SDL_PauseAudioDevice(mDeviceID, 0);
-    return true;
-}
+void Sdl2Backend::start()
+{ SDL_PauseAudioDevice(mDeviceID, 0); }
 
 void Sdl2Backend::stop()
 { SDL_PauseAudioDevice(mDeviceID, 1); }
-
-void Sdl2Backend::lock()
-{ SDL_LockAudioDevice(mDeviceID); }
-
-void Sdl2Backend::unlock()
-{ SDL_UnlockAudioDevice(mDeviceID); }
 
 } // namespace
 
@@ -201,22 +190,25 @@ bool SDL2BackendFactory::init()
 bool SDL2BackendFactory::querySupport(BackendType type)
 { return type == BackendType::Playback; }
 
-void SDL2BackendFactory::probe(DevProbe type, std::string *outnames)
+std::string SDL2BackendFactory::probe(BackendType type)
 {
-    if(type != DevProbe::Playback)
-        return;
+    std::string outnames;
+
+    if(type != BackendType::Playback)
+        return outnames;
 
     int num_devices{SDL_GetNumAudioDevices(SDL_FALSE)};
 
     /* Includes null char. */
-    outnames->append(defaultDeviceName, sizeof(defaultDeviceName));
+    outnames.append(defaultDeviceName, sizeof(defaultDeviceName));
     for(int i{0};i < num_devices;++i)
     {
         std::string name{DEVNAME_PREFIX};
         name += SDL_GetAudioDeviceName(i, SDL_FALSE);
         if(!name.empty())
-            outnames->append(name.c_str(), name.length()+1);
+            outnames.append(name.c_str(), name.length()+1);
     }
+    return outnames;
 }
 
 BackendPtr SDL2BackendFactory::createBackend(ALCdevice *device, BackendType type)

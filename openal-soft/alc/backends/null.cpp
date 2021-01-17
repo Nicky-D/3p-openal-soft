@@ -54,7 +54,7 @@ struct NullBackend final : public BackendBase {
 
     void open(const ALCchar *name) override;
     bool reset() override;
-    bool start() override;
+    void start() override;
     void stop() override;
 
     std::atomic<bool> mKillNow{true};
@@ -72,8 +72,8 @@ int NullBackend::mixerProc()
 
     int64_t done{0};
     auto start = std::chrono::steady_clock::now();
-    while(!mKillNow.load(std::memory_order_acquire) &&
-          mDevice->Connected.load(std::memory_order_acquire))
+    while(!mKillNow.load(std::memory_order_acquire)
+        && mDevice->Connected.load(std::memory_order_acquire))
     {
         auto now = std::chrono::steady_clock::now();
 
@@ -86,8 +86,7 @@ int NullBackend::mixerProc()
         }
         while(avail-done >= mDevice->UpdateSize)
         {
-            std::lock_guard<NullBackend> _{*this};
-            aluMixData(mDevice, nullptr, mDevice->UpdateSize, 0u);
+            mDevice->renderSamples(nullptr, mDevice->UpdateSize, 0u);
             done += mDevice->UpdateSize;
         }
 
@@ -120,23 +119,20 @@ void NullBackend::open(const ALCchar *name)
 
 bool NullBackend::reset()
 {
-    SetDefaultWFXChannelOrder(mDevice);
+    setDefaultWFXChannelOrder();
     return true;
 }
 
-bool NullBackend::start()
+void NullBackend::start()
 {
     try {
         mKillNow.store(false, std::memory_order_release);
         mThread = std::thread{std::mem_fn(&NullBackend::mixerProc), this};
-        return true;
     }
     catch(std::exception& e) {
-        ERR("Failed to start mixing thread: %s\n", e.what());
+        throw al::backend_exception{ALC_INVALID_DEVICE, "Failed to start mixing thread: %s",
+            e.what()};
     }
-    catch(...) {
-    }
-    return false;
 }
 
 void NullBackend::stop()
@@ -155,17 +151,19 @@ bool NullBackendFactory::init()
 bool NullBackendFactory::querySupport(BackendType type)
 { return (type == BackendType::Playback); }
 
-void NullBackendFactory::probe(DevProbe type, std::string *outnames)
+std::string NullBackendFactory::probe(BackendType type)
 {
+    std::string outnames;
     switch(type)
     {
-        case DevProbe::Playback:
-            /* Includes null char. */
-            outnames->append(nullDevice, sizeof(nullDevice));
-            break;
-        case DevProbe::Capture:
-            break;
+    case BackendType::Playback:
+        /* Includes null char. */
+        outnames.append(nullDevice, sizeof(nullDevice));
+        break;
+    case BackendType::Capture:
+        break;
     }
+    return outnames;
 }
 
 BackendPtr NullBackendFactory::createBackend(ALCdevice *device, BackendType type)

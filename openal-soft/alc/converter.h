@@ -20,24 +20,24 @@ struct SampleConverter {
     ALuint mSrcTypeSize{};
     ALuint mDstTypeSize{};
 
-    ALint mSrcPrepCount{};
+    int mSrcPrepCount{};
 
     ALuint mFracOffset{};
     ALuint mIncrement{};
     InterpState mState{};
     ResamplerFunc mResample{};
 
-    alignas(16) ALfloat mSrcSamples[BUFFERSIZE]{};
-    alignas(16) ALfloat mDstSamples[BUFFERSIZE]{};
+    alignas(16) float mSrcSamples[BUFFERSIZE]{};
+    alignas(16) float mDstSamples[BUFFERSIZE]{};
 
     struct ChanSamples {
-        alignas(16) ALfloat PrevSamples[MAX_RESAMPLER_PADDING];
+        alignas(16) float PrevSamples[MAX_RESAMPLER_PADDING];
     };
     al::FlexArray<ChanSamples> mChan;
 
     SampleConverter(size_t numchans) : mChan{numchans} { }
 
-    ALuint convert(const ALvoid **src, ALuint *srcframes, ALvoid *dst, ALuint dstframes);
+    ALuint convert(const void **src, ALuint *srcframes, void *dst, ALuint dstframes);
     ALuint availableOut(ALuint srcframes) const;
 
     DEF_FAM_NEWDEL(SampleConverter, mChan)
@@ -49,13 +49,14 @@ SampleConverterPtr CreateSampleConverter(DevFmtType srcType, DevFmtType dstType,
 
 
 struct ChannelConverter {
-    DevFmtType mSrcType;
-    DevFmtChannels mSrcChans;
-    DevFmtChannels mDstChans;
+    DevFmtType mSrcType{};
+    ALuint mSrcStep{};
+    ALuint mChanMask{};
+    DevFmtChannels mDstChans{};
 
-    bool is_active() const noexcept { return mSrcChans != mDstChans; }
+    bool is_active() const noexcept { return mChanMask != 0; }
 
-    void convert(const ALvoid *src, ALfloat *dst, ALuint frames) const;
+    void convert(const void *src, float *dst, ALuint frames) const;
 };
 
 #endif /* CONVERTER_H */

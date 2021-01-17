@@ -418,12 +418,14 @@ struct AlsaPlayback final : public BackendBase {
 
     void open(const ALCchar *name) override;
     bool reset() override;
-    bool start() override;
+    void start() override;
     void stop() override;
 
     ClockLatency getClockLatency() override;
 
     snd_pcm_t *mPcmHandle{nullptr};
+
+    std::mutex mMutex;
 
     al::vector<al::byte> mBuffer;
 
@@ -455,7 +457,7 @@ int AlsaPlayback::mixerProc()
         if(state < 0)
         {
             ERR("Invalid state detected: %s\n", snd_strerror(state));
-            aluHandleDisconnect(mDevice, "Bad state: %s", snd_strerror(state));
+            mDevice->handleDisconnect("Bad state: %s", snd_strerror(state));
             break;
         }
 
@@ -493,7 +495,7 @@ int AlsaPlayback::mixerProc()
         avail -= avail%update_size;
 
         // it is possible that contiguous areas are smaller, thus we use a loop
-        std::lock_guard<AlsaPlayback> _{*this};
+        std::lock_guard<std::mutex> _{mMutex};
         while(avail > 0)
         {
             snd_pcm_uframes_t frames{avail};
@@ -508,10 +510,10 @@ int AlsaPlayback::mixerProc()
             }
 
             char *WritePtr{static_cast<char*>(areas->addr) + (offset * areas->step / 8)};
-            aluMixData(mDevice, WritePtr, static_cast<ALuint>(frames), areas->step / samplebits);
+            mDevice->renderSamples(WritePtr, static_cast<ALuint>(frames), areas->step/samplebits);
 
             snd_pcm_sframes_t commitres{snd_pcm_mmap_commit(mPcmHandle, offset, frames)};
-            if(commitres < 0 || (static_cast<snd_pcm_uframes_t>(commitres)-frames) != 0)
+            if(commitres < 0 || static_cast<snd_pcm_uframes_t>(commitres) != frames)
             {
                 ERR("mmap commit error: %s\n",
                     snd_strerror(commitres >= 0 ? -EPIPE : static_cast<int>(commitres)));
@@ -539,7 +541,7 @@ int AlsaPlayback::mixerNoMMapProc()
         if(state < 0)
         {
             ERR("Invalid state detected: %s\n", snd_strerror(state));
-            aluHandleDisconnect(mDevice, "Bad state: %s", snd_strerror(state));
+            mDevice->handleDisconnect("Bad state: %s", snd_strerror(state));
             break;
         }
 
@@ -573,10 +575,10 @@ int AlsaPlayback::mixerNoMMapProc()
             continue;
         }
 
-        std::lock_guard<AlsaPlayback> _{*this};
         al::byte *WritePtr{mBuffer.data()};
         avail = snd_pcm_bytes_to_frames(mPcmHandle, static_cast<ssize_t>(mBuffer.size()));
-        aluMixData(mDevice, WritePtr, static_cast<ALuint>(avail), frame_step);
+        std::lock_guard<std::mutex> _{mMutex};
+        mDevice->renderSamples(WritePtr, static_cast<ALuint>(avail), frame_step);
         while(avail > 0)
         {
             snd_pcm_sframes_t ret{snd_pcm_writei(mPcmHandle, WritePtr,
@@ -785,12 +787,12 @@ bool AlsaPlayback::reset()
     mDevice->UpdateSize = static_cast<ALuint>(periodSizeInFrames);
     mDevice->Frequency = rate;
 
-    SetDefaultChannelOrder(mDevice);
+    setDefaultChannelOrder();
 
     return true;
 }
 
-bool AlsaPlayback::start()
+void AlsaPlayback::start()
 {
     int err{};
     snd_pcm_access_t access{};
@@ -816,23 +818,19 @@ bool AlsaPlayback::start()
     {
         err = snd_pcm_prepare(mPcmHandle);
         if(err < 0)
-        {
-            ERR("snd_pcm_prepare(data->mPcmHandle) failed: %s\n", snd_strerror(err));
-            return false;
-        }
+            throw al::backend_exception{ALC_INVALID_DEVICE,
+                "snd_pcm_prepare(data->mPcmHandle) failed: %s", snd_strerror(err)};
         thread_func = &AlsaPlayback::mixerProc;
     }
 
     try {
         mKillNow.store(false, std::memory_order_release);
         mThread = std::thread{std::mem_fn(thread_func), this};
-        return true;
     }
     catch(std::exception& e) {
-        ERR("Could not create playback thread: %s\n", e.what());
+        throw al::backend_exception{ALC_INVALID_DEVICE, "Failed to start mixing thread: %s",
+            e.what()};
     }
-    mBuffer.clear();
-    return false;
 }
 
 void AlsaPlayback::stop()
@@ -848,7 +846,7 @@ ClockLatency AlsaPlayback::getClockLatency()
 {
     ClockLatency ret;
 
-    std::lock_guard<AlsaPlayback> _{*this};
+    std::lock_guard<std::mutex> _{mMutex};
     ret.ClockTime = GetDeviceClockTime(mDevice);
     snd_pcm_sframes_t delay{};
     int err{snd_pcm_delay(mPcmHandle, &delay)};
@@ -869,7 +867,7 @@ struct AlsaCapture final : public BackendBase {
     ~AlsaCapture() override;
 
     void open(const ALCchar *name) override;
-    bool start() override;
+    void start() override;
     void stop() override;
     ALCenum captureSamples(al::byte *buffer, ALCuint samples) override;
     ALCuint availableSamples() override;
@@ -993,7 +991,7 @@ void AlsaCapture::open(const ALCchar *name)
 }
 
 
-bool AlsaCapture::start()
+void AlsaCapture::start()
 {
     int err{snd_pcm_prepare(mPcmHandle)};
     if(err < 0)
@@ -1006,7 +1004,6 @@ bool AlsaCapture::start()
             snd_strerror(err)};
 
     mDoCapture = true;
-    return true;
 }
 
 void AlsaCapture::stop()
@@ -1074,7 +1071,7 @@ ALCenum AlsaCapture::captureSamples(al::byte *buffer, ALCuint samples)
             {
                 const char *err{snd_strerror(static_cast<int>(amt))};
                 ERR("restore error: %s\n", err);
-                aluHandleDisconnect(mDevice, "Capture recovery failure: %s", err);
+                mDevice->handleDisconnect("Capture recovery failure: %s", err);
                 break;
             }
             /* If the amount available is less than what's asked, we lost it
@@ -1114,7 +1111,7 @@ ALCuint AlsaCapture::availableSamples()
         {
             const char *err{snd_strerror(static_cast<int>(avail))};
             ERR("restore error: %s\n", err);
-            aluHandleDisconnect(mDevice, "Capture recovery failure: %s", err);
+            mDevice->handleDisconnect("Capture recovery failure: %s", err);
         }
     }
 
@@ -1150,7 +1147,7 @@ ALCuint AlsaCapture::availableSamples()
             {
                 const char *err{snd_strerror(static_cast<int>(amt))};
                 ERR("restore error: %s\n", err);
-                aluHandleDisconnect(mDevice, "Capture recovery failure: %s", err);
+                mDevice->handleDisconnect("Capture recovery failure: %s", err);
                 break;
             }
             avail = amt;
@@ -1168,7 +1165,6 @@ ClockLatency AlsaCapture::getClockLatency()
 {
     ClockLatency ret;
 
-    std::lock_guard<AlsaCapture> _{*this};
     ret.ClockTime = GetDeviceClockTime(mDevice);
     snd_pcm_sframes_t delay{};
     int err{snd_pcm_delay(mPcmHandle, &delay)};
@@ -1228,27 +1224,31 @@ bool AlsaBackendFactory::init()
 bool AlsaBackendFactory::querySupport(BackendType type)
 { return (type == BackendType::Playback || type == BackendType::Capture); }
 
-void AlsaBackendFactory::probe(DevProbe type, std::string *outnames)
+std::string AlsaBackendFactory::probe(BackendType type)
 {
-    auto add_device = [outnames](const DevMap &entry) -> void
+    std::string outnames;
+
+    auto add_device = [&outnames](const DevMap &entry) -> void
     {
         /* +1 to also append the null char (to ensure a null-separated list and
          * double-null terminated list).
          */
-        outnames->append(entry.name.c_str(), entry.name.length()+1);
+        outnames.append(entry.name.c_str(), entry.name.length()+1);
     };
     switch(type)
     {
-        case DevProbe::Playback:
-            PlaybackDevices = probe_devices(SND_PCM_STREAM_PLAYBACK);
-            std::for_each(PlaybackDevices.cbegin(), PlaybackDevices.cend(), add_device);
-            break;
+    case BackendType::Playback:
+        PlaybackDevices = probe_devices(SND_PCM_STREAM_PLAYBACK);
+        std::for_each(PlaybackDevices.cbegin(), PlaybackDevices.cend(), add_device);
+        break;
 
-        case DevProbe::Capture:
-            CaptureDevices = probe_devices(SND_PCM_STREAM_CAPTURE);
-            std::for_each(CaptureDevices.cbegin(), CaptureDevices.cend(), add_device);
-            break;
+    case BackendType::Capture:
+        CaptureDevices = probe_devices(SND_PCM_STREAM_CAPTURE);
+        std::for_each(CaptureDevices.cbegin(), CaptureDevices.cend(), add_device);
+        break;
     }
+
+    return outnames;
 }
 
 BackendPtr AlsaBackendFactory::createBackend(ALCdevice *device, BackendType type)

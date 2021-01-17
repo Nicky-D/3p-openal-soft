@@ -37,6 +37,7 @@
 #include "alu.h"
 #include "compat.h"
 #include "endiantest.h"
+#include "logging.h"
 #include "ringbuffer.h"
 #include "threads.h"
 
@@ -154,7 +155,7 @@ struct OpenSLPlayback final : public BackendBase {
 
     void open(const ALCchar *name) override;
     bool reset() override;
-    bool start() override;
+    void start() override;
     void stop() override;
     ClockLatency getClockLatency() override;
 
@@ -170,6 +171,8 @@ struct OpenSLPlayback final : public BackendBase {
 
     RingBufferPtr mRing{nullptr};
     al::semaphore mSem;
+
+    std::mutex mMutex;
 
     ALuint mFrameSize{0};
 
@@ -230,12 +233,11 @@ int OpenSLPlayback::mixerProc()
 
     const size_t frame_step{mDevice->channelsFromFmt()};
 
-    std::unique_lock<OpenSLPlayback> dlock{*this};
     if(SL_RESULT_SUCCESS != result)
-        aluHandleDisconnect(mDevice, "Failed to get playback buffer: 0x%08x", result);
+        mDevice->handleDisconnect("Failed to get playback buffer: 0x%08x", result);
 
-    while(SL_RESULT_SUCCESS == result && !mKillNow.load(std::memory_order_acquire) &&
-          mDevice->Connected.load(std::memory_order_acquire))
+    while(SL_RESULT_SUCCESS == result && !mKillNow.load(std::memory_order_acquire)
+        && mDevice->Connected.load(std::memory_order_acquire))
     {
         if(mRing->writeSpace() == 0)
         {
@@ -250,28 +252,28 @@ int OpenSLPlayback::mixerProc()
             }
             if(SL_RESULT_SUCCESS != result)
             {
-                aluHandleDisconnect(mDevice, "Failed to start platback: 0x%08x", result);
+                mDevice->handleDisconnect("Failed to start platback: 0x%08x", result);
                 break;
             }
 
             if(mRing->writeSpace() == 0)
             {
-                dlock.unlock();
                 mSem.wait();
-                dlock.lock();
                 continue;
             }
         }
 
+        std::unique_lock<std::mutex> dlock{mMutex};
         auto data = mRing->getWriteVector();
-        aluMixData(mDevice, data.first.buf,
+        mDevice->renderSamples(data.first.buf,
             static_cast<ALuint>(data.first.len*mDevice->UpdateSize), frame_step);
         if(data.second.len > 0)
-            aluMixData(mDevice, data.second.buf,
+            mDevice->renderSamples(data.second.buf,
                 static_cast<ALuint>(data.second.len*mDevice->UpdateSize), frame_step);
 
         size_t todo{data.first.len + data.second.len};
         mRing->writeAdvance(todo);
+        dlock.unlock();
 
         for(size_t i{0};i < todo;i++)
         {
@@ -286,7 +288,7 @@ int OpenSLPlayback::mixerProc()
             PRINTERR(result, "bufferQueue->Enqueue");
             if(SL_RESULT_SUCCESS != result)
             {
-                aluHandleDisconnect(mDevice, "Failed to queue audio: 0x%08x", result);
+                mDevice->handleDisconnect("Failed to queue audio: 0x%08x", result);
                 break;
             }
 
@@ -429,7 +431,7 @@ bool OpenSLPlayback::reset()
     mDevice->FmtChans = DevFmtStereo;
     mDevice->FmtType = DevFmtShort;
 
-    SetDefaultWFXChannelOrder(mDevice);
+    setDefaultWFXChannelOrder();
     mFrameSize = mDevice->frameSizeFromFmt();
 
 
@@ -538,7 +540,7 @@ bool OpenSLPlayback::reset()
     return true;
 }
 
-bool OpenSLPlayback::start()
+void OpenSLPlayback::start()
 {
     mRing->reset();
 
@@ -546,24 +548,23 @@ bool OpenSLPlayback::start()
     SLresult result{VCALL(mBufferQueueObj,GetInterface)(SL_IID_ANDROIDSIMPLEBUFFERQUEUE,
         &bufferQueue)};
     PRINTERR(result, "bufferQueue->GetInterface");
+    if(SL_RESULT_SUCCESS == result)
+    {
+        result = VCALL(bufferQueue,RegisterCallback)(&OpenSLPlayback::processC, this);
+        PRINTERR(result, "bufferQueue->RegisterCallback");
+    }
     if(SL_RESULT_SUCCESS != result)
-        return false;
-
-    result = VCALL(bufferQueue,RegisterCallback)(&OpenSLPlayback::processC, this);
-    PRINTERR(result, "bufferQueue->RegisterCallback");
-    if(SL_RESULT_SUCCESS != result) return false;
+        throw al::backend_exception{ALC_INVALID_DEVICE, "Failed to register callback: 0x%08x",
+            result};
 
     try {
         mKillNow.store(false, std::memory_order_release);
         mThread = std::thread(std::mem_fn(&OpenSLPlayback::mixerProc), this);
-        return true;
     }
     catch(std::exception& e) {
-        ERR("Could not create playback thread: %s\n", e.what());
+        throw al::backend_exception{ALC_INVALID_DEVICE, "Failed to start mixing thread: %s",
+            e.what()};
     }
-    catch(...) {
-    }
-    return false;
 }
 
 void OpenSLPlayback::stop()
@@ -611,7 +612,7 @@ ClockLatency OpenSLPlayback::getClockLatency()
 {
     ClockLatency ret;
 
-    std::lock_guard<OpenSLPlayback> _{*this};
+    std::lock_guard<std::mutex> _{mMutex};
     ret.ClockTime = GetDeviceClockTime(mDevice);
     ret.Latency  = std::chrono::seconds{mRing->readSpace() * mDevice->UpdateSize};
     ret.Latency /= mDevice->Frequency;
@@ -629,7 +630,7 @@ struct OpenSLCapture final : public BackendBase {
     { static_cast<OpenSLCapture*>(context)->process(bq); }
 
     void open(const ALCchar *name) override;
-    bool start() override;
+    void start() override;
     void stop() override;
     ALCenum captureSamples(al::byte *buffer, ALCuint samples) override;
     ALCuint availableSamples() override;
@@ -835,7 +836,7 @@ void OpenSLCapture::open(const ALCchar* name)
     mDevice->DeviceName = name;
 }
 
-bool OpenSLCapture::start()
+void OpenSLCapture::start()
 {
     SLRecordItf record;
     SLresult result{VCALL(mRecordObj,GetInterface)(SL_IID_RECORD, &record)};
@@ -846,14 +847,8 @@ bool OpenSLCapture::start()
         result = VCALL(record,SetRecordState)(SL_RECORDSTATE_RECORDING);
         PRINTERR(result, "record->SetRecordState");
     }
-
     if(SL_RESULT_SUCCESS != result)
-    {
-        aluHandleDisconnect(mDevice, "Failed to start capture: 0x%08x", result);
-        return false;
-    }
-
-    return true;
+        throw al::backend_exception{ALC_INVALID_DEVICE, "Failed to start capture: 0x%08x", result};
 }
 
 void OpenSLCapture::stop()
@@ -879,7 +874,7 @@ ALCenum OpenSLCapture::captureSamples(al::byte *buffer, ALCuint samples)
         PRINTERR(result, "recordObj->GetInterface");
         if UNLIKELY(SL_RESULT_SUCCESS != result)
         {
-            aluHandleDisconnect(mDevice, "Failed to get capture buffer queue: 0x%08x", result);
+            mDevice->handleDisconnect("Failed to get capture buffer queue: 0x%08x", result);
             bufferQueue = nullptr;
         }
     }
@@ -909,8 +904,7 @@ ALCenum OpenSLCapture::captureSamples(al::byte *buffer, ALCuint samples)
                 PRINTERR(result, "bufferQueue->Enqueue");
                 if UNLIKELY(SL_RESULT_SUCCESS != result)
                 {
-                    aluHandleDisconnect(mDevice, "Failed to update capture buffer: 0x%08x",
-                        result);
+                    mDevice->handleDisconnect("Failed to update capture buffer: 0x%08x", result);
                     bufferQueue = nullptr;
                 }
             }
@@ -938,16 +932,18 @@ bool OSLBackendFactory::init() { return true; }
 bool OSLBackendFactory::querySupport(BackendType type)
 { return (type == BackendType::Playback || type == BackendType::Capture); }
 
-void OSLBackendFactory::probe(DevProbe type, std::string *outnames)
+std::string OSLBackendFactory::probe(BackendType type)
 {
+    std::string outnames;
     switch(type)
     {
-        case DevProbe::Playback:
-        case DevProbe::Capture:
-            /* Includes null char. */
-            outnames->append(opensl_device, sizeof(opensl_device));
-            break;
+    case BackendType::Playback:
+    case BackendType::Capture:
+        /* Includes null char. */
+        outnames.append(opensl_device, sizeof(opensl_device));
+        break;
     }
+    return outnames;
 }
 
 BackendPtr OSLBackendFactory::createBackend(ALCdevice *device, BackendType type)

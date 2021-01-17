@@ -22,19 +22,20 @@ enum {
     PSHIFTER_EFFECT,
     VMORPHER_EFFECT,
     DEDICATED_EFFECT,
+    CONVOLUTION_EFFECT,
 
     MAX_EFFECTS
 };
-extern ALboolean DisabledEffects[MAX_EFFECTS];
+extern bool DisabledEffects[MAX_EFFECTS];
 
-extern ALfloat ReverbBoost;
+extern float ReverbBoost;
 
 struct EffectList {
     const char name[16];
     int type;
     ALenum val;
 };
-extern const EffectList gEffectList[15];
+extern const EffectList gEffectList[16];
 
 
 struct ALeffect {
@@ -47,9 +48,11 @@ struct ALeffect {
 
     /* Self ID */
     ALuint id{0u};
+
+    DISABLE_ALLOC()
 };
 
-inline ALboolean IsReverbEffect(ALenum type)
+inline bool IsReverbEffect(const ALenum type) noexcept
 { return type == AL_EFFECT_REVERB || type == AL_EFFECT_EAXREVERB; }
 
 EffectStateFactory *getFactoryByType(ALenum type);
