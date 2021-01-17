@@ -27,8 +27,6 @@ source_environment_tempfile="$stage/source_environment.sh"
 "$autobuild" source_environment > "$source_environment_tempfile"
 . "$source_environment_tempfile"
 
-build=${AUTOBUILD_BUILD_ID:=0}
-
 # Restore all .sos
 restore_sos ()
 {
