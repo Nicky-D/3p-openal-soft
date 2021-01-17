@@ -19,7 +19,6 @@
 #include "atomic.h"
 #include "inprogext.h"
 #include "intrusive_ptr.h"
-#include "logging.h"
 #include "threads.h"
 #include "vector.h"
 #include "voice.h"
@@ -43,16 +42,39 @@ enum class DistanceModel {
 };
 
 
+struct WetBuffer {
+    bool mInUse;
+    al::FlexArray<FloatBufferLine, 16> mBuffer;
+
+    WetBuffer(size_t count) : mBuffer{count} { }
+
+    DEF_FAM_NEWDEL(WetBuffer, mBuffer)
+};
+using WetBufferPtr = std::unique_ptr<WetBuffer>;
+
+
 struct ALcontextProps {
-    ALfloat DopplerFactor;
-    ALfloat DopplerVelocity;
-    ALfloat SpeedOfSound;
-    ALboolean SourceDistanceModel;
+    float DopplerFactor;
+    float DopplerVelocity;
+    float SpeedOfSound;
+    bool SourceDistanceModel;
     DistanceModel mDistanceModel;
 
     std::atomic<ALcontextProps*> next;
 
     DEF_NEWDEL(ALcontextProps)
+};
+
+
+struct VoiceChange {
+    Voice *mOldVoice{nullptr};
+    Voice *mVoice{nullptr};
+    ALuint mSourceID{0};
+    ALenum mState{0};
+
+    std::atomic<VoiceChange*> mNext{nullptr};
+
+    DEF_NEWDEL(VoiceChange)
 };
 
 
@@ -99,11 +121,11 @@ struct ALCcontext : public al::intrusive_ref<ALCcontext> {
     std::atomic<ALenum> mLastError{AL_NO_ERROR};
 
     DistanceModel mDistanceModel{DistanceModel::Default};
-    ALboolean mSourceDistanceModel{AL_FALSE};
+    bool mSourceDistanceModel{false};
 
-    ALfloat mDopplerFactor{1.0f};
-    ALfloat mDopplerVelocity{1.0f};
-    ALfloat mSpeedOfSound{SPEEDOFSOUNDMETRESPERSEC};
+    float mDopplerFactor{1.0f};
+    float mDopplerVelocity{1.0f};
+    float mSpeedOfSound{SpeedOfSoundMetersPerSec};
 
     std::atomic_flag mPropsClean;
     std::atomic<bool> mDeferUpdates{false};
@@ -116,7 +138,7 @@ struct ALCcontext : public al::intrusive_ref<ALCcontext> {
     RefCount mUpdateCount{0u};
     std::atomic<bool> mHoldUpdates{false};
 
-    ALfloat mGainBoost{1.0f};
+    float mGainBoost{1.0f};
 
     std::atomic<ALcontextProps*> mUpdate{nullptr};
 
@@ -125,10 +147,50 @@ struct ALCcontext : public al::intrusive_ref<ALCcontext> {
      */
     std::atomic<ALcontextProps*> mFreeContextProps{nullptr};
     std::atomic<ALlistenerProps*> mFreeListenerProps{nullptr};
-    std::atomic<ALvoiceProps*> mFreeVoiceProps{nullptr};
+    std::atomic<VoicePropsItem*> mFreeVoiceProps{nullptr};
     std::atomic<ALeffectslotProps*> mFreeEffectslotProps{nullptr};
 
-    al::vector<ALvoice> mVoices;
+    /* Asynchronous voice change actions are processed as a linked list of
+     * VoiceChange objects by the mixer, which is atomically appended to.
+     * However, to avoid allocating each object individually, they're allocated
+     * in clusters that are stored in a vector for easy automatic cleanup.
+     */
+    using VoiceChangeCluster = std::unique_ptr<VoiceChange[]>;
+    al::vector<VoiceChangeCluster> mVoiceChangeClusters;
+
+    /* The voice change tail is the beginning of the "free" elements, up to and
+     * *excluding* the current. If tail==current, there's no free elements and
+     * new ones need to be allocated. The current voice change is the element
+     * last processed, and any after are pending.
+     */
+    VoiceChange *mVoiceChangeTail{};
+    std::atomic<VoiceChange*> mCurrentVoiceChange{};
+
+    void allocVoiceChanges(size_t addcount);
+
+
+    using VoiceCluster = std::unique_ptr<Voice[]>;
+    al::vector<VoiceCluster> mVoiceClusters;
+
+    using VoiceArray = al::FlexArray<Voice*>;
+    std::atomic<VoiceArray*> mVoices{};
+    std::atomic<size_t> mActiveVoiceCount{};
+
+    void allocVoices(size_t addcount);
+    al::span<Voice*> getVoicesSpan() const noexcept
+    {
+        return {mVoices.load(std::memory_order_relaxed)->data(),
+            mActiveVoiceCount.load(std::memory_order_relaxed)};
+    }
+    al::span<Voice*> getVoicesSpanAcquired() const noexcept
+    {
+        return {mVoices.load(std::memory_order_acquire)->data(),
+            mActiveVoiceCount.load(std::memory_order_acquire)};
+    }
+
+
+    /* Wet buffers used by effect slots. */
+    al::vector<WetBufferPtr> mWetBuffers;
 
     using ALeffectslotArray = al::FlexArray<ALeffectslot*>;
     std::atomic<ALeffectslotArray*> mActiveAuxSlots{nullptr};
@@ -145,7 +207,7 @@ struct ALCcontext : public al::intrusive_ref<ALCcontext> {
     std::unique_ptr<ALeffectslot> mDefaultSlot;
 
     const al::intrusive_ptr<ALCdevice> mDevice;
-    const ALCchar *mExtensionList{nullptr};
+    const char *mExtensionList{nullptr};
 
     ALlistener mListener{};
 
@@ -168,12 +230,12 @@ struct ALCcontext : public al::intrusive_ref<ALCcontext> {
      * This does *NOT* stop mixing, but rather prevents certain property
      * changes from taking effect.
      */
-    void deferUpdates() noexcept { mDeferUpdates.store(true); }
+    void deferUpdates() noexcept { mDeferUpdates.exchange(true, std::memory_order_acq_rel); }
 
     /** Resumes update processing after being deferred. */
     void processUpdates();
 
-    void setError(ALenum errorCode, const char *msg, ...) DECL_FORMAT(printf, 3, 4);
+    [[gnu::format(printf,3,4)]] void setError(ALenum errorCode, const char *msg, ...);
 
     DEF_NEWDEL(ALCcontext)
 };

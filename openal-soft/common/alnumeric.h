@@ -90,21 +90,33 @@ inline size_t RoundUp(size_t value, size_t r) noexcept
 }
 
 
-/* Define CTZ macros (count trailing zeros), and POPCNT macros (population
- * count/count 1 bits), for 32- and 64-bit integers. The CTZ macros' results
- * are *UNDEFINED* if the value is 0.
+/* Define CountTrailingZeros (count trailing zero bits, starting from the lsb)
+ * and PopCount (population count/count 1 bits) methods, for 32- and 64-bit
+ * integers. The CountTrailingZeros results are *UNDEFINED* if the value is 0.
  */
+template<typename T>
+inline int PopCount(T val) = delete;
+template<typename T>
+inline int CountTrailingZeros(T val) = delete;
+
 #ifdef __GNUC__
 
-#define POPCNT32 __builtin_popcount
-#define CTZ32 __builtin_ctz
-#if SIZEOF_LONG == 8
-#define POPCNT64 __builtin_popcountl
-#define CTZ64 __builtin_ctzl
-#else
-#define POPCNT64 __builtin_popcountll
-#define CTZ64 __builtin_ctzll
-#endif
+/* Define variations for unsigned (long (long)) int, since we don't know what
+ * uint32/64_t are typedef'd to.
+ */
+template<>
+inline int PopCount(unsigned long long val) { return __builtin_popcountll(val); }
+template<>
+inline int PopCount(unsigned long val) { return __builtin_popcountl(val); }
+template<>
+inline int PopCount(unsigned int val) { return __builtin_popcount(val); }
+
+template<>
+inline int CountTrailingZeros(unsigned long long val) { return __builtin_ctzll(val); }
+template<>
+inline int CountTrailingZeros(unsigned long val) { return __builtin_ctzl(val); }
+template<>
+inline int CountTrailingZeros(unsigned int val) { return __builtin_ctz(val); }
 
 #else
 
@@ -115,69 +127,69 @@ inline size_t RoundUp(size_t value, size_t r) noexcept
  * as the ntz2 variant. These likely aren't the most efficient methods, but
  * they're good enough if the GCC built-ins aren't available.
  */
-inline int fallback_popcnt32(uint32_t v)
+template<>
+inline int PopCount(uint32_t v)
 {
     v = v - ((v >> 1) & 0x55555555u);
     v = (v & 0x33333333u) + ((v >> 2) & 0x33333333u);
     v = (v + (v >> 4)) & 0x0f0f0f0fu;
-    return (int)((v * 0x01010101u) >> 24);
+    return static_cast<int>((v * 0x01010101u) >> 24);
 }
-#define POPCNT32 fallback_popcnt32
-inline int fallback_popcnt64(uint64_t v)
+template<>
+inline int PopCount(uint64_t v)
 {
     v = v - ((v >> 1) & 0x5555555555555555_u64);
     v = (v & 0x3333333333333333_u64) + ((v >> 2) & 0x3333333333333333_u64);
     v = (v + (v >> 4)) & 0x0f0f0f0f0f0f0f0f_u64;
-    return (int)((v * 0x0101010101010101_u64) >> 56);
+    return static_cast<int>((v * 0x0101010101010101_u64) >> 56);
 }
-#define POPCNT64 fallback_popcnt64
 
-#if defined(HAVE_BITSCANFORWARD64_INTRINSIC)
+#if defined(_WIN64)
 
-inline int msvc64_ctz32(uint32_t v)
+template<>
+inline int CountTrailingZeros(uint32_t v)
 {
     unsigned long idx = 32;
     _BitScanForward(&idx, v);
-    return (int)idx;
+    return static_cast<int>(idx);
 }
-#define CTZ32 msvc64_ctz32
-inline int msvc64_ctz64(uint64_t v)
+template<>
+inline int CountTrailingZeros(uint64_t v)
 {
     unsigned long idx = 64;
     _BitScanForward64(&idx, v);
-    return (int)idx;
+    return static_cast<int>(idx);
 }
-#define CTZ64 msvc64_ctz64
 
-#elif defined(HAVE_BITSCANFORWARD_INTRINSIC)
+#elif defined(_WIN32)
 
-inline int msvc_ctz32(uint32_t v)
+template<>
+inline int CountTrailingZeros(uint32_t v)
 {
     unsigned long idx = 32;
     _BitScanForward(&idx, v);
-    return (int)idx;
+    return static_cast<int>(idx);
 }
-#define CTZ32 msvc_ctz32
-inline int msvc_ctz64(uint64_t v)
+template<>
+inline int CountTrailingZeros(uint64_t v)
 {
     unsigned long idx = 64;
-    if(!_BitScanForward(&idx, (uint32_t)(v&0xffffffff)))
+    if(!_BitScanForward(&idx, static_cast<uint32_t>(v&0xffffffff)))
     {
-        if(_BitScanForward(&idx, (uint32_t)(v>>32)))
+        if(_BitScanForward(&idx, static_cast<uint32_t>(v>>32)))
             idx += 32;
     }
-    return (int)idx;
+    return static_cast<int>(idx);
 }
-#define CTZ64 msvc_ctz64
 
 #else
 
-inline int fallback_ctz32(uint32_t value)
-{ return POPCNT32(~value & (value - 1)); }
-#define CTZ32 fallback_ctz32
-inline int fallback_ctz64(uint64_t value)
-{ return POPCNT64(~value & (value - 1)); }
-#define CTZ64 fallback_ctz64
+template<>
+inline int CountTrailingZeros(uint32_t value)
+{ return PopCount(~value & (value - 1)); }
+template<>
+inline int CountTrailingZeros(uint64_t value)
+{ return PopCount(~value & (value - 1)); }
 
 #endif
 #endif
@@ -225,8 +237,9 @@ inline int float2int(float f) noexcept
 #if defined(HAVE_SSE_INTRINSICS)
     return _mm_cvtt_ss2si(_mm_set_ss(f));
 
-#elif ((defined(__GNUC__) || defined(__clang__)) && (defined(__i386__) || defined(__x86_64__)) && \
-       !defined(__SSE_MATH__)) || (defined(_MSC_VER) && defined(_M_IX86_FP) && _M_IX86_FP == 0)
+#elif (defined(_MSC_VER) && defined(_M_IX86_FP) && _M_IX86_FP == 0) \
+    || ((defined(__GNUC__) || defined(__clang__)) && (defined(__i386__) || defined(__x86_64__)) \
+        && !defined(__SSE_MATH__))
     int sign, shift, mant;
     union {
         float f;
@@ -260,9 +273,9 @@ inline int double2int(double d) noexcept
 #if defined(HAVE_SSE_INTRINSICS)
     return _mm_cvttsd_si32(_mm_set_sd(d));
 
-#elif ((defined(__GNUC__) || defined(__clang__)) && (defined(__i386__) || defined(__x86_64__)) && \
-       !defined(__SSE2_MATH__)) || (defined(_MSC_VER) && defined(_M_IX86_FP) && _M_IX86_FP < 2)
-
+#elif (defined(_MSC_VER) && defined(_M_IX86_FP) && _M_IX86_FP < 2) \
+    || ((defined(__GNUC__) || defined(__clang__)) && (defined(__i386__) || defined(__x86_64__)) \
+        && !defined(__SSE2_MATH__))
     int sign, shift;
     int64_t mant;
     union {
@@ -296,8 +309,8 @@ inline int double2int(double d) noexcept
  */
 inline float fast_roundf(float f) noexcept
 {
-#if (defined(__GNUC__) || defined(__clang__)) && (defined(__i386__) || defined(__x86_64__)) && \
-    !defined(__SSE_MATH__)
+#if (defined(__GNUC__) || defined(__clang__)) && (defined(__i386__) || defined(__x86_64__)) \
+    && !defined(__SSE_MATH__)
 
     float out;
     __asm__ __volatile__("frndint" : "=t"(out) : "0"(f));

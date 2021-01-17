@@ -31,6 +31,7 @@
 #include "alu.h"
 #include "ringbuffer.h"
 #include "converter.h"
+#include "logging.h"
 #include "backends/base.h"
 
 #include <unistd.h>
@@ -60,7 +61,7 @@ struct CoreAudioPlayback final : public BackendBase {
 
     void open(const ALCchar *name) override;
     bool reset() override;
-    bool start() override;
+    void start() override;
     void stop() override;
 
     AudioUnit mAudioUnit{};
@@ -81,8 +82,7 @@ CoreAudioPlayback::~CoreAudioPlayback()
 OSStatus CoreAudioPlayback::MixerProc(AudioUnitRenderActionFlags*, const AudioTimeStamp*, UInt32,
     UInt32, AudioBufferList *ioData) noexcept
 {
-    std::lock_guard<CoreAudioPlayback> _{*this};
-    aluMixData(mDevice, ioData->mBuffers[0].mData, ioData->mBuffers[0].mDataByteSize/mFrameSize,
+    mDevice->renderSamples(ioData->mBuffers[0].mData, ioData->mBuffers[0].mDataByteSize/mFrameSize,
         ioData->mBuffers[0].mNumberChannels);
     return noErr;
 }
@@ -195,7 +195,7 @@ bool CoreAudioPlayback::reset()
             streamFormat.mChannelsPerFrame = 2;
             break;
     }
-    SetDefaultWFXChannelOrder(mDevice);
+    setDefaultWFXChannelOrder();
 
     /* use channel count and sample rate from the default output unit's current
      * parameters, but reset everything else */
@@ -269,15 +269,11 @@ bool CoreAudioPlayback::reset()
     return true;
 }
 
-bool CoreAudioPlayback::start()
+void CoreAudioPlayback::start()
 {
-    OSStatus err{AudioOutputUnitStart(mAudioUnit)};
+    const OSStatus err{AudioOutputUnitStart(mAudioUnit)};
     if(err != noErr)
-    {
-        ERR("AudioOutputUnitStart failed\n");
-        return false;
-    }
-    return true;
+        throw al::backend_exception{ALC_INVALID_DEVICE, "AudioOutputUnitStart failed: %d", err};
 }
 
 void CoreAudioPlayback::stop()
@@ -304,7 +300,7 @@ struct CoreAudioCapture final : public BackendBase {
     }
 
     void open(const ALCchar *name) override;
-    bool start() override;
+    void start() override;
     void stop() override;
     ALCenum captureSamples(al::byte *buffer, ALCuint samples) override;
     ALCuint availableSamples() override;
@@ -576,15 +572,11 @@ void CoreAudioCapture::open(const ALCchar *name)
 }
 
 
-bool CoreAudioCapture::start()
+void CoreAudioCapture::start()
 {
     OSStatus err{AudioOutputUnitStart(mAudioUnit)};
     if(err != noErr)
-    {
-        ERR("AudioOutputUnitStart failed\n");
-        return false;
-    }
-    return true;
+        throw al::backend_exception{ALC_INVALID_DEVICE, "AudioOutputUnitStart failed: %d", err};
 }
 
 void CoreAudioCapture::stop()
@@ -638,16 +630,18 @@ bool CoreAudioBackendFactory::init() { return true; }
 bool CoreAudioBackendFactory::querySupport(BackendType type)
 { return type == BackendType::Playback || type == BackendType::Capture; }
 
-void CoreAudioBackendFactory::probe(DevProbe type, std::string *outnames)
+std::string CoreAudioBackendFactory::probe(BackendType type)
 {
+    std::string outnames;
     switch(type)
     {
-        case DevProbe::Playback:
-        case DevProbe::Capture:
-            /* Includes null char. */
-            outnames->append(ca_device, sizeof(ca_device));
-            break;
+    case BackendType::Playback:
+    case BackendType::Capture:
+        /* Includes null char. */
+        outnames.append(ca_device, sizeof(ca_device));
+        break;
     }
+    return outnames;
 }
 
 BackendPtr CoreAudioBackendFactory::createBackend(ALCdevice *device, BackendType type)

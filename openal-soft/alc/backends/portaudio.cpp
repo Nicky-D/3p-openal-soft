@@ -32,6 +32,7 @@
 #include "alconfig.h"
 #include "dynload.h"
 #include "ringbuffer.h"
+#include "logging.h"
 
 #include <portaudio.h>
 
@@ -87,7 +88,7 @@ struct PortPlayback final : public BackendBase {
 
     void open(const ALCchar *name) override;
     bool reset() override;
-    bool start() override;
+    void start() override;
     void stop() override;
 
     PaStream *mStream{nullptr};
@@ -109,9 +110,8 @@ PortPlayback::~PortPlayback()
 int PortPlayback::writeCallback(const void*, void *outputBuffer, unsigned long framesPerBuffer,
     const PaStreamCallbackTimeInfo*, const PaStreamCallbackFlags) noexcept
 {
-    std::lock_guard<PortPlayback> _{*this};
-    aluMixData(mDevice, outputBuffer, static_cast<ALuint>(framesPerBuffer),
-        mDevice->channelsFromFmt());
+    mDevice->renderSamples(outputBuffer, static_cast<ALuint>(framesPerBuffer),
+        static_cast<ALuint>(mParams.channelCount));
     return 0;
 }
 
@@ -204,20 +204,17 @@ bool PortPlayback::reset()
         ERR("Unexpected channel count: %u\n", mParams.channelCount);
         return false;
     }
-    SetDefaultChannelOrder(mDevice);
+    setDefaultChannelOrder();
 
     return true;
 }
 
-bool PortPlayback::start()
+void PortPlayback::start()
 {
-    PaError err{Pa_StartStream(mStream)};
-    if(err != paNoError)
-    {
-        ERR("Pa_StartStream() returned an error: %s\n", Pa_GetErrorText(err));
-        return false;
-    }
-    return true;
+    const PaError err{Pa_StartStream(mStream)};
+    if(err == paNoError)
+        throw al::backend_exception{ALC_INVALID_DEVICE, "Failed to start playback: %s",
+            Pa_GetErrorText(err)};
 }
 
 void PortPlayback::stop()
@@ -243,7 +240,7 @@ struct PortCapture final : public BackendBase {
     }
 
     void open(const ALCchar *name) override;
-    bool start() override;
+    void start() override;
     void stop() override;
     ALCenum captureSamples(al::byte *buffer, ALCuint samples) override;
     ALCuint availableSamples() override;
@@ -326,15 +323,12 @@ void PortCapture::open(const ALCchar *name)
 }
 
 
-bool PortCapture::start()
+void PortCapture::start()
 {
-    PaError err{Pa_StartStream(mStream)};
+    const PaError err{Pa_StartStream(mStream)};
     if(err != paNoError)
-    {
-        ERR("Error starting stream: %s\n", Pa_GetErrorText(err));
-        return false;
-    }
-    return true;
+        throw al::backend_exception{ALC_INVALID_DEVICE, "Failed to start recording: %s",
+            Pa_GetErrorText(err)};
 }
 
 void PortCapture::stop()
@@ -420,16 +414,18 @@ bool PortBackendFactory::init()
 bool PortBackendFactory::querySupport(BackendType type)
 { return (type == BackendType::Playback || type == BackendType::Capture); }
 
-void PortBackendFactory::probe(DevProbe type, std::string *outnames)
+std::string PortBackendFactory::probe(BackendType type)
 {
+    std::string outnames;
     switch(type)
     {
-        case DevProbe::Playback:
-        case DevProbe::Capture:
-            /* Includes null char. */
-            outnames->append(pa_device, sizeof(pa_device));
-            break;
+    case BackendType::Playback:
+    case BackendType::Capture:
+        /* Includes null char. */
+        outnames.append(pa_device, sizeof(pa_device));
+        break;
     }
+    return outnames;
 }
 
 BackendPtr PortBackendFactory::createBackend(ALCdevice *device, BackendType type)

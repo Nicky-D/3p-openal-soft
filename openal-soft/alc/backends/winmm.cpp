@@ -28,6 +28,7 @@
 
 #include <windows.h>
 #include <mmsystem.h>
+#include <mmreg.h>
 
 #include <array>
 #include <atomic>
@@ -40,10 +41,11 @@
 #include "alcmain.h"
 #include "alexcpt.h"
 #include "alu.h"
+#include "compat.h"
+#include "logging.h"
 #include "ringbuffer.h"
 #include "strutils.h"
 #include "threads.h"
-#include "compat.h"
 
 #ifndef WAVE_FORMAT_IEEE_FLOAT
 #define WAVE_FORMAT_IEEE_FLOAT  0x0003
@@ -135,7 +137,7 @@ struct WinMMPlayback final : public BackendBase {
 
     void open(const ALCchar *name) override;
     bool reset() override;
-    bool start() override;
+    void start() override;
     void stop() override;
 
     std::atomic<ALuint> mWritable{0u};
@@ -182,16 +184,13 @@ FORCE_ALIGN int WinMMPlayback::mixerProc()
 
     const size_t frame_step{mDevice->channelsFromFmt()};
 
-    std::unique_lock<WinMMPlayback> dlock{*this};
     while(!mKillNow.load(std::memory_order_acquire) &&
           mDevice->Connected.load(std::memory_order_acquire))
     {
         ALsizei todo = mWritable.load(std::memory_order_acquire);
         if(todo < 1)
         {
-            dlock.unlock();
             mSem.wait();
-            dlock.lock();
             continue;
         }
 
@@ -200,7 +199,7 @@ FORCE_ALIGN int WinMMPlayback::mixerProc()
             WAVEHDR &waveHdr = mWaveBuffer[widx];
             widx = (widx+1) % mWaveBuffer.size();
 
-            aluMixData(mDevice, waveHdr.lpData, mDevice->UpdateSize, frame_step);
+            mDevice->renderSamples(waveHdr.lpData, mDevice->UpdateSize, frame_step);
             mWritable.fetch_sub(1, std::memory_order_acq_rel);
             waveOutWrite(mOutHdl, &waveHdr, sizeof(WAVEHDR));
         } while(--todo);
@@ -265,7 +264,7 @@ bool WinMMPlayback::reset()
 {
     mDevice->BufferSize = static_cast<ALuint>(uint64_t{mDevice->BufferSize} *
         mFormat.nSamplesPerSec / mDevice->Frequency);
-    mDevice->BufferSize = (mDevice->BufferSize+3) & ~0x3;
+    mDevice->BufferSize = (mDevice->BufferSize+3) & ~0x3u;
     mDevice->UpdateSize = mDevice->BufferSize / 4;
     mDevice->Frequency = mFormat.nSamplesPerSec;
 
@@ -297,16 +296,23 @@ bool WinMMPlayback::reset()
         return false;
     }
 
+    ALuint chanmask{};
     if(mFormat.nChannels == 2)
+    {
         mDevice->FmtChans = DevFmtStereo;
+        chanmask = SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT;
+    }
     else if(mFormat.nChannels == 1)
+    {
         mDevice->FmtChans = DevFmtMono;
+        chanmask = SPEAKER_FRONT_CENTER;
+    }
     else
     {
         ERR("Unhandled channel count: %d\n", mFormat.nChannels);
         return false;
     }
-    SetDefaultWFXChannelOrder(mDevice);
+    setChannelOrderFromWFXMask(chanmask);
 
     ALuint BufferSize{mDevice->UpdateSize * mDevice->frameSizeFromFmt()};
 
@@ -325,7 +331,7 @@ bool WinMMPlayback::reset()
     return true;
 }
 
-bool WinMMPlayback::start()
+void WinMMPlayback::start()
 {
     try {
         std::for_each(mWaveBuffer.begin(), mWaveBuffer.end(),
@@ -336,14 +342,11 @@ bool WinMMPlayback::start()
 
         mKillNow.store(false, std::memory_order_release);
         mThread = std::thread{std::mem_fn(&WinMMPlayback::mixerProc), this};
-        return true;
     }
     catch(std::exception& e) {
-        ERR("Failed to start mixing thread: %s\n", e.what());
+        throw al::backend_exception{ALC_INVALID_DEVICE, "Failed to start mixing thread: %s",
+            e.what()};
     }
-    catch(...) {
-    }
-    return false;
 }
 
 void WinMMPlayback::stop()
@@ -373,7 +376,7 @@ struct WinMMCapture final : public BackendBase {
     int captureProc();
 
     void open(const ALCchar *name) override;
-    bool start() override;
+    void start() override;
     void stop() override;
     ALCenum captureSamples(al::byte *buffer, ALCuint samples) override;
     ALCuint availableSamples() override;
@@ -422,16 +425,13 @@ int WinMMCapture::captureProc()
 {
     althrd_setname(RECORD_THREAD_NAME);
 
-    std::unique_lock<WinMMCapture> dlock{*this};
     while(!mKillNow.load(std::memory_order_acquire) &&
           mDevice->Connected.load(std::memory_order_acquire))
     {
         ALuint todo{mReadable.load(std::memory_order_acquire)};
         if(todo < 1)
         {
-            dlock.unlock();
             mSem.wait();
-            dlock.lock();
             continue;
         }
 
@@ -536,7 +536,7 @@ void WinMMCapture::open(const ALCchar *name)
     mDevice->DeviceName = CaptureDevices[DeviceID];
 }
 
-bool WinMMCapture::start()
+void WinMMCapture::start()
 {
     try {
         for(size_t i{0};i < mWaveBuffer.size();++i)
@@ -549,14 +549,11 @@ bool WinMMCapture::start()
         mThread = std::thread{std::mem_fn(&WinMMCapture::captureProc), this};
 
         waveInStart(mInHdl);
-        return true;
     }
     catch(std::exception& e) {
-        ERR("Failed to start mixing thread: %s\n", e.what());
+        throw al::backend_exception{ALC_INVALID_DEVICE, "Failed to start recording thread: %s",
+            e.what()};
     }
-    catch(...) {
-    }
-    return false;
 }
 
 void WinMMCapture::stop()
@@ -596,28 +593,30 @@ bool WinMMBackendFactory::init()
 bool WinMMBackendFactory::querySupport(BackendType type)
 { return type == BackendType::Playback || type == BackendType::Capture; }
 
-void WinMMBackendFactory::probe(DevProbe type, std::string *outnames)
+std::string WinMMBackendFactory::probe(BackendType type)
 {
-    auto add_device = [outnames](const std::string &dname) -> void
+    std::string outnames;
+    auto add_device = [&outnames](const std::string &dname) -> void
     {
         /* +1 to also append the null char (to ensure a null-separated list and
          * double-null terminated list).
          */
         if(!dname.empty())
-            outnames->append(dname.c_str(), dname.length()+1);
+            outnames.append(dname.c_str(), dname.length()+1);
     };
     switch(type)
     {
-        case DevProbe::Playback:
-            ProbePlaybackDevices();
-            std::for_each(PlaybackDevices.cbegin(), PlaybackDevices.cend(), add_device);
-            break;
+    case BackendType::Playback:
+        ProbePlaybackDevices();
+        std::for_each(PlaybackDevices.cbegin(), PlaybackDevices.cend(), add_device);
+        break;
 
-        case DevProbe::Capture:
-            ProbeCaptureDevices();
-            std::for_each(CaptureDevices.cbegin(), CaptureDevices.cend(), add_device);
-            break;
+    case BackendType::Capture:
+        ProbeCaptureDevices();
+        std::for_each(CaptureDevices.cbegin(), CaptureDevices.cend(), add_device);
+        break;
     }
+    return outnames;
 }
 
 BackendPtr WinMMBackendFactory::createBackend(ALCdevice *device, BackendType type)

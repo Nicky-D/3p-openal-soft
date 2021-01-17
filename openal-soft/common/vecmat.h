@@ -69,15 +69,14 @@ public:
         mVals[idx][3] = d;
     }
 
-    static const Matrix &Identity() noexcept
+    static constexpr Matrix Identity() noexcept
     {
-        static constexpr Matrix identity{
+        return Matrix{
             1.0f, 0.0f, 0.0f, 0.0f,
             0.0f, 1.0f, 0.0f, 0.0f,
             0.0f, 0.0f, 1.0f, 0.0f,
             0.0f, 0.0f, 0.0f, 1.0f
         };
-        return identity;
     }
 };
 

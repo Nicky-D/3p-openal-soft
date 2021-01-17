@@ -116,7 +116,7 @@ END_API_FUNC
 } while(0)
 
 
-AL_API ALvoid AL_APIENTRY alEnable(ALenum capability)
+AL_API void AL_APIENTRY alEnable(ALenum capability)
 START_API_FUNC
 {
     ContextRef context{GetContextRef()};
@@ -126,7 +126,7 @@ START_API_FUNC
     switch(capability)
     {
     case AL_SOURCE_DISTANCE_MODEL:
-        context->mSourceDistanceModel = AL_TRUE;
+        context->mSourceDistanceModel = true;
         DO_UPDATEPROPS();
         break;
 
@@ -136,7 +136,7 @@ START_API_FUNC
 }
 END_API_FUNC
 
-AL_API ALvoid AL_APIENTRY alDisable(ALenum capability)
+AL_API void AL_APIENTRY alDisable(ALenum capability)
 START_API_FUNC
 {
     ContextRef context{GetContextRef()};
@@ -146,7 +146,7 @@ START_API_FUNC
     switch(capability)
     {
     case AL_SOURCE_DISTANCE_MODEL:
-        context->mSourceDistanceModel = AL_FALSE;
+        context->mSourceDistanceModel = false;
         DO_UPDATEPROPS();
         break;
 
@@ -167,7 +167,7 @@ START_API_FUNC
     switch(capability)
     {
     case AL_SOURCE_DISTANCE_MODEL:
-        value = context->mSourceDistanceModel;
+        value = context->mSourceDistanceModel ? AL_TRUE : AL_FALSE;
         break;
 
     default:
@@ -214,7 +214,7 @@ START_API_FUNC
         break;
 
     case AL_GAIN_LIMIT_SOFT:
-        if(GAIN_MIX_MAX/context->mGainBoost != 0.0f)
+        if(GainMixMax/context->mGainBoost != 0.0f)
             value = AL_TRUE;
         break;
 
@@ -267,7 +267,7 @@ START_API_FUNC
         break;
 
     case AL_GAIN_LIMIT_SOFT:
-        value = ALdouble{GAIN_MIX_MAX}/context->mGainBoost;
+        value = ALdouble{GainMixMax}/context->mGainBoost;
         break;
 
     case AL_NUM_RESAMPLERS_SOFT:
@@ -318,7 +318,7 @@ START_API_FUNC
         break;
 
     case AL_GAIN_LIMIT_SOFT:
-        value = GAIN_MIX_MAX/context->mGainBoost;
+        value = GainMixMax/context->mGainBoost;
         break;
 
     case AL_NUM_RESAMPLERS_SOFT:
@@ -369,7 +369,7 @@ START_API_FUNC
         break;
 
     case AL_GAIN_LIMIT_SOFT:
-        value = static_cast<ALint>(GAIN_MIX_MAX/context->mGainBoost);
+        value = static_cast<ALint>(GainMixMax/context->mGainBoost);
         break;
 
     case AL_NUM_RESAMPLERS_SOFT:
@@ -420,7 +420,7 @@ START_API_FUNC
         break;
 
     case AL_GAIN_LIMIT_SOFT:
-        value = static_cast<ALint64SOFT>(GAIN_MIX_MAX/context->mGainBoost);
+        value = static_cast<ALint64SOFT>(GainMixMax/context->mGainBoost);
         break;
 
     case AL_NUM_RESAMPLERS_SOFT:
@@ -439,7 +439,7 @@ START_API_FUNC
 }
 END_API_FUNC
 
-AL_API void* AL_APIENTRY alGetPointerSOFT(ALenum pname)
+AL_API ALvoid* AL_APIENTRY alGetPointerSOFT(ALenum pname)
 START_API_FUNC
 {
     ContextRef context{GetContextRef()};
@@ -465,7 +465,7 @@ START_API_FUNC
 }
 END_API_FUNC
 
-AL_API ALvoid AL_APIENTRY alGetBooleanv(ALenum pname, ALboolean *values)
+AL_API void AL_APIENTRY alGetBooleanv(ALenum pname, ALboolean *values)
 START_API_FUNC
 {
     if(values)
@@ -498,7 +498,7 @@ START_API_FUNC
 }
 END_API_FUNC
 
-AL_API ALvoid AL_APIENTRY alGetDoublev(ALenum pname, ALdouble *values)
+AL_API void AL_APIENTRY alGetDoublev(ALenum pname, ALdouble *values)
 START_API_FUNC
 {
     if(values)
@@ -531,7 +531,7 @@ START_API_FUNC
 }
 END_API_FUNC
 
-AL_API ALvoid AL_APIENTRY alGetFloatv(ALenum pname, ALfloat *values)
+AL_API void AL_APIENTRY alGetFloatv(ALenum pname, ALfloat *values)
 START_API_FUNC
 {
     if(values)
@@ -564,7 +564,7 @@ START_API_FUNC
 }
 END_API_FUNC
 
-AL_API ALvoid AL_APIENTRY alGetIntegerv(ALenum pname, ALint *values)
+AL_API void AL_APIENTRY alGetIntegerv(ALenum pname, ALint *values)
 START_API_FUNC
 {
     if(values)
@@ -630,7 +630,7 @@ START_API_FUNC
 }
 END_API_FUNC
 
-AL_API void AL_APIENTRY alGetPointervSOFT(ALenum pname, void **values)
+AL_API void AL_APIENTRY alGetPointervSOFT(ALenum pname, ALvoid **values)
 START_API_FUNC
 {
     if(values)
@@ -713,7 +713,7 @@ START_API_FUNC
 }
 END_API_FUNC
 
-AL_API ALvoid AL_APIENTRY alDopplerFactor(ALfloat value)
+AL_API void AL_APIENTRY alDopplerFactor(ALfloat value)
 START_API_FUNC
 {
     ContextRef context{GetContextRef()};
@@ -730,25 +730,11 @@ START_API_FUNC
 }
 END_API_FUNC
 
-AL_API ALvoid AL_APIENTRY alDopplerVelocity(ALfloat value)
+AL_API void AL_APIENTRY alDopplerVelocity(ALfloat value)
 START_API_FUNC
 {
     ContextRef context{GetContextRef()};
     if UNLIKELY(!context) return;
-
-    if((context->mEnabledEvts.load(std::memory_order_relaxed)&EventType_Deprecated))
-    {
-        std::lock_guard<std::mutex> _{context->mEventCbLock};
-        ALbitfieldSOFT enabledevts{context->mEnabledEvts.load(std::memory_order_relaxed)};
-        if((enabledevts&EventType_Deprecated) && context->mEventCb)
-        {
-            static const char msg[] =
-                "alDopplerVelocity is deprecated in AL1.1, use alSpeedOfSound";
-            const ALsizei msglen{sizeof(msg)-1};
-            (*context->mEventCb)(AL_EVENT_TYPE_DEPRECATED_SOFT, 0, 0, msglen, msg,
-                context->mEventParam);
-        }
-    }
 
     if(!(value >= 0.0f && std::isfinite(value)))
         context->setError(AL_INVALID_VALUE, "Doppler velocity %f out of range", value);
@@ -761,7 +747,7 @@ START_API_FUNC
 }
 END_API_FUNC
 
-AL_API ALvoid AL_APIENTRY alSpeedOfSound(ALfloat value)
+AL_API void AL_APIENTRY alSpeedOfSound(ALfloat value)
 START_API_FUNC
 {
     ContextRef context{GetContextRef()};
@@ -778,7 +764,7 @@ START_API_FUNC
 }
 END_API_FUNC
 
-AL_API ALvoid AL_APIENTRY alDistanceModel(ALenum value)
+AL_API void AL_APIENTRY alDistanceModel(ALenum value)
 START_API_FUNC
 {
     ContextRef context{GetContextRef()};
@@ -800,7 +786,7 @@ START_API_FUNC
 END_API_FUNC
 
 
-AL_API ALvoid AL_APIENTRY alDeferUpdatesSOFT(void)
+AL_API void AL_APIENTRY alDeferUpdatesSOFT(void)
 START_API_FUNC
 {
     ContextRef context{GetContextRef()};
@@ -810,7 +796,7 @@ START_API_FUNC
 }
 END_API_FUNC
 
-AL_API ALvoid AL_APIENTRY alProcessUpdatesSOFT(void)
+AL_API void AL_APIENTRY alProcessUpdatesSOFT(void)
 START_API_FUNC
 {
     ContextRef context{GetContextRef()};

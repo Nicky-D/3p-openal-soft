@@ -47,9 +47,10 @@
 #include "alcmain.h"
 #include "alexcpt.h"
 #include "alu.h"
-#include "ringbuffer.h"
 #include "compat.h"
 #include "dynload.h"
+#include "logging.h"
+#include "ringbuffer.h"
 #include "strutils.h"
 #include "threads.h"
 
@@ -106,6 +107,14 @@ HRESULT (WINAPI *pDirectSoundCaptureEnumerateW)(LPDSENUMCALLBACKW pDSEnumCallbac
 #endif
 #endif
 
+
+#define MONO SPEAKER_FRONT_CENTER
+#define STEREO (SPEAKER_FRONT_LEFT|SPEAKER_FRONT_RIGHT)
+#define QUAD (SPEAKER_FRONT_LEFT|SPEAKER_FRONT_RIGHT|SPEAKER_BACK_LEFT|SPEAKER_BACK_RIGHT)
+#define X5DOT1 (SPEAKER_FRONT_LEFT|SPEAKER_FRONT_RIGHT|SPEAKER_FRONT_CENTER|SPEAKER_LOW_FREQUENCY|SPEAKER_SIDE_LEFT|SPEAKER_SIDE_RIGHT)
+#define X5DOT1REAR (SPEAKER_FRONT_LEFT|SPEAKER_FRONT_RIGHT|SPEAKER_FRONT_CENTER|SPEAKER_LOW_FREQUENCY|SPEAKER_BACK_LEFT|SPEAKER_BACK_RIGHT)
+#define X6DOT1 (SPEAKER_FRONT_LEFT|SPEAKER_FRONT_RIGHT|SPEAKER_FRONT_CENTER|SPEAKER_LOW_FREQUENCY|SPEAKER_BACK_CENTER|SPEAKER_SIDE_LEFT|SPEAKER_SIDE_RIGHT)
+#define X7DOT1 (SPEAKER_FRONT_LEFT|SPEAKER_FRONT_RIGHT|SPEAKER_FRONT_CENTER|SPEAKER_LOW_FREQUENCY|SPEAKER_BACK_LEFT|SPEAKER_BACK_RIGHT|SPEAKER_SIDE_LEFT|SPEAKER_SIDE_RIGHT)
 
 #define MAX_UPDATES 128
 
@@ -168,7 +177,7 @@ struct DSoundPlayback final : public BackendBase {
 
     void open(const ALCchar *name) override;
     bool reset() override;
-    bool start() override;
+    void start() override;
     void stop() override;
 
     IDirectSound       *mDS{nullptr};
@@ -215,7 +224,7 @@ FORCE_ALIGN int DSoundPlayback::mixerProc()
     if(FAILED(err))
     {
         ERR("Failed to get buffer caps: 0x%lx\n", err);
-        aluHandleDisconnect(mDevice, "Failure retrieving playback buffer info: 0x%lx", err);
+        mDevice->handleDisconnect("Failure retrieving playback buffer info: 0x%lx", err);
         return 1;
     }
 
@@ -242,7 +251,7 @@ FORCE_ALIGN int DSoundPlayback::mixerProc()
                 if(FAILED(err))
                 {
                     ERR("Failed to play buffer: 0x%lx\n", err);
-                    aluHandleDisconnect(mDevice, "Failure starting playback: 0x%lx", err);
+                    mDevice->handleDisconnect("Failure starting playback: 0x%lx", err);
                     return 1;
                 }
                 Playing = true;
@@ -276,19 +285,16 @@ FORCE_ALIGN int DSoundPlayback::mixerProc()
 
         if(SUCCEEDED(err))
         {
-            std::unique_lock<DSoundPlayback> dlock{*this};
-            aluMixData(mDevice, WritePtr1, WriteCnt1/FrameSize, FrameStep);
+            mDevice->renderSamples(WritePtr1, WriteCnt1/FrameSize, FrameStep);
             if(WriteCnt2 > 0)
-                aluMixData(mDevice, WritePtr2, WriteCnt2/FrameSize, FrameStep);
-            dlock.unlock();
+                mDevice->renderSamples(WritePtr2, WriteCnt2/FrameSize, FrameStep);
 
             mBuffer->Unlock(WritePtr1, WriteCnt1, WritePtr2, WriteCnt2);
         }
         else
         {
             ERR("Buffer lock error: %#lx\n", err);
-            std::lock_guard<DSoundPlayback> _{*this};
-            aluHandleDisconnect(mDevice, "Failed to lock output buffer: 0x%lx", err);
+            mDevice->handleDisconnect("Failed to lock output buffer: 0x%lx", err);
             return 1;
         }
 
@@ -323,11 +329,18 @@ void DSoundPlayback::open(const ALCchar *name)
     else
     {
         auto iter = std::find_if(PlaybackDevices.cbegin(), PlaybackDevices.cend(),
-            [name](const DevMap &entry) -> bool
-            { return entry.name == name; }
-        );
+            [name](const DevMap &entry) -> bool { return entry.name == name; });
         if(iter == PlaybackDevices.cend())
-            throw al::backend_exception{ALC_INVALID_VALUE, "Device name \"%s\" not found", name};
+        {
+            GUID id{};
+            hr = CLSIDFromString(utf8_to_wstr(name).c_str(), &id);
+            if(SUCCEEDED(hr))
+                iter = std::find_if(PlaybackDevices.cbegin(), PlaybackDevices.cend(),
+                    [&id](const DevMap &entry) -> bool { return entry.guid == id; });
+            if(iter == PlaybackDevices.cend())
+                throw al::backend_exception{ALC_INVALID_VALUE, "Device name \"%s\" not found",
+                    name};
+        }
         guid = &iter->guid;
     }
 
@@ -360,23 +373,23 @@ bool DSoundPlayback::reset()
 
     switch(mDevice->FmtType)
     {
-        case DevFmtByte:
-            mDevice->FmtType = DevFmtUByte;
+    case DevFmtByte:
+        mDevice->FmtType = DevFmtUByte;
+        break;
+    case DevFmtFloat:
+        if(mDevice->Flags.get<SampleTypeRequest>())
             break;
-        case DevFmtFloat:
-            if(mDevice->Flags.get<SampleTypeRequest>())
-                break;
-            /* fall-through */
-        case DevFmtUShort:
-            mDevice->FmtType = DevFmtShort;
-            break;
-        case DevFmtUInt:
-            mDevice->FmtType = DevFmtInt;
-            break;
-        case DevFmtUByte:
-        case DevFmtShort:
-        case DevFmtInt:
-            break;
+        /* fall-through */
+    case DevFmtUShort:
+        mDevice->FmtType = DevFmtShort;
+        break;
+    case DevFmtUInt:
+        mDevice->FmtType = DevFmtInt;
+        break;
+    case DevFmtUByte:
+    case DevFmtShort:
+    case DevFmtInt:
+        break;
     }
 
     WAVEFORMATEXTENSIBLE OutputType{};
@@ -402,62 +415,20 @@ bool DSoundPlayback::reset()
             else
                 ERR("Unknown system speaker config: 0x%lx\n", speakers);
         }
-        mDevice->IsHeadphones = (mDevice->FmtChans == DevFmtStereo &&
-                                 speakers == DSSPEAKER_HEADPHONE);
+        mDevice->IsHeadphones = mDevice->FmtChans == DevFmtStereo
+            && speakers == DSSPEAKER_HEADPHONE;
 
         switch(mDevice->FmtChans)
         {
-            case DevFmtMono:
-                OutputType.dwChannelMask = SPEAKER_FRONT_CENTER;
-                break;
-            case DevFmtAmbi3D:
-                mDevice->FmtChans = DevFmtStereo;
-                /*fall-through*/
-            case DevFmtStereo:
-                OutputType.dwChannelMask = SPEAKER_FRONT_LEFT |
-                                           SPEAKER_FRONT_RIGHT;
-                break;
-            case DevFmtQuad:
-                OutputType.dwChannelMask = SPEAKER_FRONT_LEFT |
-                                           SPEAKER_FRONT_RIGHT |
-                                           SPEAKER_BACK_LEFT |
-                                           SPEAKER_BACK_RIGHT;
-                break;
-            case DevFmtX51:
-                OutputType.dwChannelMask = SPEAKER_FRONT_LEFT |
-                                           SPEAKER_FRONT_RIGHT |
-                                           SPEAKER_FRONT_CENTER |
-                                           SPEAKER_LOW_FREQUENCY |
-                                           SPEAKER_SIDE_LEFT |
-                                           SPEAKER_SIDE_RIGHT;
-                break;
-            case DevFmtX51Rear:
-                OutputType.dwChannelMask = SPEAKER_FRONT_LEFT |
-                                           SPEAKER_FRONT_RIGHT |
-                                           SPEAKER_FRONT_CENTER |
-                                           SPEAKER_LOW_FREQUENCY |
-                                           SPEAKER_BACK_LEFT |
-                                           SPEAKER_BACK_RIGHT;
-                break;
-            case DevFmtX61:
-                OutputType.dwChannelMask = SPEAKER_FRONT_LEFT |
-                                           SPEAKER_FRONT_RIGHT |
-                                           SPEAKER_FRONT_CENTER |
-                                           SPEAKER_LOW_FREQUENCY |
-                                           SPEAKER_BACK_CENTER |
-                                           SPEAKER_SIDE_LEFT |
-                                           SPEAKER_SIDE_RIGHT;
-                break;
-            case DevFmtX71:
-                OutputType.dwChannelMask = SPEAKER_FRONT_LEFT |
-                                           SPEAKER_FRONT_RIGHT |
-                                           SPEAKER_FRONT_CENTER |
-                                           SPEAKER_LOW_FREQUENCY |
-                                           SPEAKER_BACK_LEFT |
-                                           SPEAKER_BACK_RIGHT |
-                                           SPEAKER_SIDE_LEFT |
-                                           SPEAKER_SIDE_RIGHT;
-                break;
+        case DevFmtMono: OutputType.dwChannelMask = MONO; break;
+        case DevFmtAmbi3D: mDevice->FmtChans = DevFmtStereo;
+            /*fall-through*/
+        case DevFmtStereo: OutputType.dwChannelMask = STEREO; break;
+        case DevFmtQuad: OutputType.dwChannelMask = QUAD; break;
+        case DevFmtX51: OutputType.dwChannelMask = X5DOT1; break;
+        case DevFmtX51Rear: OutputType.dwChannelMask = X5DOT1REAR; break;
+        case DevFmtX61: OutputType.dwChannelMask = X6DOT1; break;
+        case DevFmtX71: OutputType.dwChannelMask = X7DOT1; break;
         }
 
 retry_open:
@@ -509,8 +480,8 @@ retry_open:
 
         DSBUFFERDESC DSBDescription{};
         DSBDescription.dwSize = sizeof(DSBDescription);
-        DSBDescription.dwFlags = DSBCAPS_CTRLPOSITIONNOTIFY | DSBCAPS_GETCURRENTPOSITION2 |
-                                 DSBCAPS_GLOBALFOCUS;
+        DSBDescription.dwFlags = DSBCAPS_CTRLPOSITIONNOTIFY | DSBCAPS_GETCURRENTPOSITION2
+            | DSBCAPS_GLOBALFOCUS;
         DSBDescription.dwBufferBytes = mDevice->BufferSize * OutputType.Format.nBlockAlign;
         DSBDescription.lpwfxFormat = &OutputType.Format;
 
@@ -528,8 +499,7 @@ retry_open:
         hr = mBuffer->QueryInterface(IID_IDirectSoundNotify, &ptr);
         if(SUCCEEDED(hr))
         {
-            auto Notifies = static_cast<IDirectSoundNotify*>(ptr);
-            mNotifies = Notifies;
+            mNotifies = static_cast<IDirectSoundNotify*>(ptr);
 
             ALuint num_updates{mDevice->BufferSize / mDevice->UpdateSize};
             assert(num_updates <= MAX_UPDATES);
@@ -540,7 +510,7 @@ retry_open:
                 nots[i].dwOffset = i * mDevice->UpdateSize * OutputType.Format.nBlockAlign;
                 nots[i].hEventNotify = mNotifyEvent;
             }
-            if(Notifies->SetNotificationPositions(num_updates, nots.data()) != DS_OK)
+            if(mNotifies->SetNotificationPositions(num_updates, nots.data()) != DS_OK)
                 hr = E_FAIL;
         }
     }
@@ -560,24 +530,21 @@ retry_open:
     }
 
     ResetEvent(mNotifyEvent);
-    SetDefaultWFXChannelOrder(mDevice);
+    setChannelOrderFromWFXMask(OutputType.dwChannelMask);
 
     return true;
 }
 
-bool DSoundPlayback::start()
+void DSoundPlayback::start()
 {
     try {
         mKillNow.store(false, std::memory_order_release);
         mThread = std::thread{std::mem_fn(&DSoundPlayback::mixerProc), this};
-        return true;
     }
     catch(std::exception& e) {
-        ERR("Failed to start mixing thread: %s\n", e.what());
+        throw al::backend_exception{ALC_INVALID_DEVICE, "Failed to start mixing thread: %s",
+            e.what()};
     }
-    catch(...) {
-    }
-    return false;
 }
 
 void DSoundPlayback::stop()
@@ -595,7 +562,7 @@ struct DSoundCapture final : public BackendBase {
     ~DSoundCapture() override;
 
     void open(const ALCchar *name) override;
-    bool start() override;
+    void start() override;
     void stop() override;
     ALCenum captureSamples(al::byte *buffer, ALCuint samples) override;
     ALCuint availableSamples() override;
@@ -648,11 +615,18 @@ void DSoundCapture::open(const ALCchar *name)
     else
     {
         auto iter = std::find_if(CaptureDevices.cbegin(), CaptureDevices.cend(),
-            [name](const DevMap &entry) -> bool
-            { return entry.name == name; }
-        );
+            [name](const DevMap &entry) -> bool { return entry.name == name; });
         if(iter == CaptureDevices.cend())
-            throw al::backend_exception{ALC_INVALID_VALUE, "Device name \"%s\" not found", name};
+        {
+            GUID id{};
+            hr = CLSIDFromString(utf8_to_wstr(name).c_str(), &id);
+            if(SUCCEEDED(hr))
+                iter = std::find_if(CaptureDevices.cbegin(), CaptureDevices.cend(),
+                    [&id](const DevMap &entry) -> bool { return entry.guid == id; });
+            if(iter == CaptureDevices.cend())
+                throw al::backend_exception{ALC_INVALID_VALUE, "Device name \"%s\" not found",
+                    name};
+        }
         guid = &iter->guid;
     }
 
@@ -675,33 +649,13 @@ void DSoundCapture::open(const ALCchar *name)
     WAVEFORMATEXTENSIBLE InputType{};
     switch(mDevice->FmtChans)
     {
-    case DevFmtMono:
-        InputType.dwChannelMask = SPEAKER_FRONT_CENTER;
-        break;
-    case DevFmtStereo:
-        InputType.dwChannelMask = SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT;
-        break;
-    case DevFmtQuad:
-        InputType.dwChannelMask = SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT | SPEAKER_BACK_LEFT |
-            SPEAKER_BACK_RIGHT;
-        break;
-    case DevFmtX51:
-        InputType.dwChannelMask = SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT | SPEAKER_FRONT_CENTER |
-            SPEAKER_LOW_FREQUENCY | SPEAKER_SIDE_LEFT | SPEAKER_SIDE_RIGHT;
-        break;
-    case DevFmtX51Rear:
-        InputType.dwChannelMask = SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT | SPEAKER_FRONT_CENTER |
-            SPEAKER_LOW_FREQUENCY | SPEAKER_BACK_LEFT | SPEAKER_BACK_RIGHT;
-        break;
-    case DevFmtX61:
-        InputType.dwChannelMask = SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT | SPEAKER_FRONT_CENTER |
-            SPEAKER_LOW_FREQUENCY | SPEAKER_BACK_CENTER | SPEAKER_SIDE_LEFT | SPEAKER_SIDE_RIGHT;
-        break;
-    case DevFmtX71:
-        InputType.dwChannelMask = SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT | SPEAKER_FRONT_CENTER |
-            SPEAKER_LOW_FREQUENCY | SPEAKER_BACK_LEFT | SPEAKER_BACK_RIGHT | SPEAKER_SIDE_LEFT |
-            SPEAKER_SIDE_RIGHT;
-        break;
+    case DevFmtMono: InputType.dwChannelMask = MONO; break;
+    case DevFmtStereo: InputType.dwChannelMask = STEREO; break;
+    case DevFmtQuad: InputType.dwChannelMask = QUAD; break;
+    case DevFmtX51: InputType.dwChannelMask = X5DOT1; break;
+    case DevFmtX51Rear: InputType.dwChannelMask = X5DOT1REAR; break;
+    case DevFmtX61: InputType.dwChannelMask = X6DOT1; break;
+    case DevFmtX71: InputType.dwChannelMask = X7DOT1; break;
     case DevFmtAmbi3D:
         WARN("%s capture not supported\n", DevFmtChannelsString(mDevice->FmtChans));
         throw al::backend_exception{ALC_INVALID_VALUE, "%s capture not supported",
@@ -759,21 +713,16 @@ void DSoundCapture::open(const ALCchar *name)
     }
 
     mBufferBytes = DSCBDescription.dwBufferBytes;
-    SetDefaultWFXChannelOrder(mDevice);
+    setChannelOrderFromWFXMask(InputType.dwChannelMask);
 
     mDevice->DeviceName = name;
 }
 
-bool DSoundCapture::start()
+void DSoundCapture::start()
 {
-    HRESULT hr{mDSCbuffer->Start(DSCBSTART_LOOPING)};
+    const HRESULT hr{mDSCbuffer->Start(DSCBSTART_LOOPING)};
     if(FAILED(hr))
-    {
-        ERR("start failed: 0x%08lx\n", hr);
-        aluHandleDisconnect(mDevice, "Failure starting capture: 0x%lx", hr);
-        return false;
-    }
-    return true;
+        throw al::backend_exception{ALC_INVALID_DEVICE, "Failure starting capture: 0x%lx", hr};
 }
 
 void DSoundCapture::stop()
@@ -782,7 +731,7 @@ void DSoundCapture::stop()
     if(FAILED(hr))
     {
         ERR("stop failed: 0x%08lx\n", hr);
-        aluHandleDisconnect(mDevice, "Failure stopping capture: 0x%lx", hr);
+        mDevice->handleDisconnect("Failure stopping capture: 0x%lx", hr);
     }
 }
 
@@ -797,9 +746,9 @@ ALCuint DSoundCapture::availableSamples()
     if(!mDevice->Connected.load(std::memory_order_acquire))
         return static_cast<ALCuint>(mRing->readSpace());
 
-    ALuint FrameSize{mDevice->frameSizeFromFmt()};
-    DWORD BufferBytes{mBufferBytes};
-    DWORD LastCursor{mCursor};
+    const ALuint FrameSize{mDevice->frameSizeFromFmt()};
+    const DWORD BufferBytes{mBufferBytes};
+    const DWORD LastCursor{mCursor};
 
     DWORD ReadCursor{};
     void *ReadPtr1{}, *ReadPtr2{};
@@ -807,8 +756,8 @@ ALCuint DSoundCapture::availableSamples()
     HRESULT hr{mDSCbuffer->GetCurrentPosition(nullptr, &ReadCursor)};
     if(SUCCEEDED(hr))
     {
-        DWORD NumBytes{(ReadCursor-LastCursor + BufferBytes) % BufferBytes};
-        if(!NumBytes) return static_cast<ALCubyte>(mRing->readSpace());
+        const DWORD NumBytes{(BufferBytes+ReadCursor-LastCursor) % BufferBytes};
+        if(!NumBytes) return static_cast<ALCuint>(mRing->readSpace());
         hr = mDSCbuffer->Lock(LastCursor, NumBytes, &ReadPtr1, &ReadCnt1, &ReadPtr2, &ReadCnt2, 0);
     }
     if(SUCCEEDED(hr))
@@ -817,13 +766,13 @@ ALCuint DSoundCapture::availableSamples()
         if(ReadPtr2 != nullptr && ReadCnt2 > 0)
             mRing->write(ReadPtr2, ReadCnt2/FrameSize);
         hr = mDSCbuffer->Unlock(ReadPtr1, ReadCnt1, ReadPtr2, ReadCnt2);
-        mCursor = (LastCursor+ReadCnt1+ReadCnt2) % BufferBytes;
+        mCursor = ReadCursor;
     }
 
     if(FAILED(hr))
     {
         ERR("update failed: 0x%08lx\n", hr);
-        aluHandleDisconnect(mDevice, "Failure retrieving capture data: 0x%lx", hr);
+        mDevice->handleDisconnect("Failure retrieving capture data: 0x%lx", hr);
     }
 
     return static_cast<ALCuint>(mRing->readSpace());
@@ -872,14 +821,15 @@ bool DSoundBackendFactory::init()
 bool DSoundBackendFactory::querySupport(BackendType type)
 { return (type == BackendType::Playback || type == BackendType::Capture); }
 
-void DSoundBackendFactory::probe(DevProbe type, std::string *outnames)
+std::string DSoundBackendFactory::probe(BackendType type)
 {
-    auto add_device = [outnames](const DevMap &entry) -> void
+    std::string outnames;
+    auto add_device = [&outnames](const DevMap &entry) -> void
     {
         /* +1 to also append the null char (to ensure a null-separated list and
          * double-null terminated list).
          */
-        outnames->append(entry.name.c_str(), entry.name.length()+1);
+        outnames.append(entry.name.c_str(), entry.name.length()+1);
     };
 
     /* Initialize COM to prevent name truncation */
@@ -887,24 +837,26 @@ void DSoundBackendFactory::probe(DevProbe type, std::string *outnames)
     HRESULT hrcom{CoInitialize(nullptr)};
     switch(type)
     {
-        case DevProbe::Playback:
-            PlaybackDevices.clear();
-            hr = DirectSoundEnumerateW(DSoundEnumDevices, &PlaybackDevices);
-            if(FAILED(hr))
-                ERR("Error enumerating DirectSound playback devices (0x%lx)!\n", hr);
-            std::for_each(PlaybackDevices.cbegin(), PlaybackDevices.cend(), add_device);
-            break;
+    case BackendType::Playback:
+        PlaybackDevices.clear();
+        hr = DirectSoundEnumerateW(DSoundEnumDevices, &PlaybackDevices);
+        if(FAILED(hr))
+            ERR("Error enumerating DirectSound playback devices (0x%lx)!\n", hr);
+        std::for_each(PlaybackDevices.cbegin(), PlaybackDevices.cend(), add_device);
+        break;
 
-        case DevProbe::Capture:
-            CaptureDevices.clear();
-            hr = DirectSoundCaptureEnumerateW(DSoundEnumDevices, &CaptureDevices);
-            if(FAILED(hr))
-                ERR("Error enumerating DirectSound capture devices (0x%lx)!\n", hr);
-            std::for_each(CaptureDevices.cbegin(), CaptureDevices.cend(), add_device);
-            break;
+    case BackendType::Capture:
+        CaptureDevices.clear();
+        hr = DirectSoundCaptureEnumerateW(DSoundEnumDevices, &CaptureDevices);
+        if(FAILED(hr))
+            ERR("Error enumerating DirectSound capture devices (0x%lx)!\n", hr);
+        std::for_each(CaptureDevices.cbegin(), CaptureDevices.cend(), add_device);
+        break;
     }
     if(SUCCEEDED(hrcom))
         CoUninitialize();
+
+    return outnames;
 }
 
 BackendPtr DSoundBackendFactory::createBackend(ALCdevice *device, BackendType type)

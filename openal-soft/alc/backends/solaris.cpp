@@ -42,9 +42,10 @@
 #include "alexcpt.h"
 #include "alu.h"
 #include "alconfig.h"
+#include "compat.h"
+#include "logging.h"
 #include "threads.h"
 #include "vector.h"
-#include "compat.h"
 
 #include <sys/audioio.h>
 
@@ -64,7 +65,7 @@ struct SolarisBackend final : public BackendBase {
 
     void open(const ALCchar *name) override;
     bool reset() override;
-    bool start() override;
+    void start() override;
     void stop() override;
 
     int mFd{-1};
@@ -92,7 +93,6 @@ int SolarisBackend::mixerProc()
     const size_t frame_step{mDevice->channelsFromFmt()};
     const ALuint frame_size{mDevice->frameSizeFromFmt()};
 
-    std::unique_lock<SolarisBackend> dlock{*this};
     while(!mKillNow.load(std::memory_order_acquire) &&
           mDevice->Connected.load(std::memory_order_acquire))
     {
@@ -100,16 +100,13 @@ int SolarisBackend::mixerProc()
         pollitem.fd = mFd;
         pollitem.events = POLLOUT;
 
-        dlock.unlock();
         int pret{poll(&pollitem, 1, 1000)};
-        dlock.lock();
         if(pret < 0)
         {
             if(errno == EINTR || errno == EAGAIN)
                 continue;
             ERR("poll failed: %s\n", strerror(errno));
-            aluHandleDisconnect(mDevice, "Failed to wait for playback buffer: %s",
-                strerror(errno));
+            mDevice->handleDisconnect("Failed to wait for playback buffer: %s", strerror(errno));
             break;
         }
         else if(pret == 0)
@@ -120,7 +117,7 @@ int SolarisBackend::mixerProc()
 
         ALubyte *write_ptr{mBuffer.data()};
         size_t to_write{mBuffer.size()};
-        aluMixData(mDevice, write_ptr, to_write/frame_size, frame_step);
+        mDevice->renderSamples(write_ptr, static_cast<ALuint>(to_write/frame_size), frame_step);
         while(to_write > 0 && !mKillNow.load(std::memory_order_acquire))
         {
             ssize_t wrote{write(mFd, write_ptr, to_write)};
@@ -129,12 +126,11 @@ int SolarisBackend::mixerProc()
                 if(errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
                     continue;
                 ERR("write failed: %s\n", strerror(errno));
-                aluHandleDisconnect(mDevice, "Failed to write playback samples: %s",
-                    strerror(errno));
+                mDevice->handleDisconnect("Failed to write playback samples: %s", strerror(errno));
                 break;
             }
 
-            to_write -= wrote;
+            to_write -= static_cast<size_t>(wrote);
             write_ptr += wrote;
         }
     }
@@ -222,7 +218,7 @@ bool SolarisBackend::reset()
     mDevice->BufferSize = info.play.buffer_size / frameSize;
     mDevice->UpdateSize = mDevice->BufferSize / 2;
 
-    SetDefaultChannelOrder(mDevice);
+    setDefaultChannelOrder();
 
     mBuffer.resize(mDevice->UpdateSize * mDevice->frameSizeFromFmt());
     std::fill(mBuffer.begin(), mBuffer.end(), 0);
@@ -230,19 +226,16 @@ bool SolarisBackend::reset()
     return true;
 }
 
-bool SolarisBackend::start()
+void SolarisBackend::start()
 {
     try {
         mKillNow.store(false, std::memory_order_release);
         mThread = std::thread{std::mem_fn(&SolarisBackend::mixerProc), this};
-        return true;
     }
     catch(std::exception& e) {
-        ERR("Could not create playback thread: %s\n", e.what());
+        throw al::backend_exception{ALC_INVALID_DEVICE, "Failed to start mixing thread: %s",
+            e.what()};
     }
-    catch(...) {
-    }
-    return false;
 }
 
 void SolarisBackend::stop()
@@ -273,23 +266,23 @@ bool SolarisBackendFactory::init()
 bool SolarisBackendFactory::querySupport(BackendType type)
 { return type == BackendType::Playback; }
 
-void SolarisBackendFactory::probe(DevProbe type, std::string *outnames)
+std::string SolarisBackendFactory::probe(BackendType type)
 {
+    std::string outnames;
     switch(type)
     {
-        case DevProbe::Playback:
-        {
-#ifdef HAVE_STAT
-            struct stat buf;
-            if(stat(solaris_driver.c_str(), &buf) == 0)
-#endif
-                outnames->append(solaris_device, sizeof(solaris_device));
-        }
-        break;
-
-        case DevProbe::Capture:
-            break;
+    case BackendType::Playback:
+    {
+        struct stat buf;
+        if(stat(solaris_driver.c_str(), &buf) == 0)
+            outnames.append(solaris_device, sizeof(solaris_device));
     }
+    break;
+
+    case BackendType::Capture:
+        break;
+    }
+    return outnames;
 }
 
 BackendPtr SolarisBackendFactory::createBackend(ALCdevice *device, BackendType type)

@@ -3,136 +3,206 @@
 
 #include "uhjfilter.h"
 
+#ifdef HAVE_SSE_INTRINSICS
+#include <xmmintrin.h>
+#endif
+
 #include <algorithm>
 #include <iterator>
 
 #include "AL/al.h"
 
+#include "alcomplex.h"
 #include "alnumeric.h"
 #include "opthelpers.h"
 
 
 namespace {
 
-/* This is the maximum number of samples processed for each inner loop
- * iteration. */
-#define MAX_UPDATE_SAMPLES  128
+using complex_d = std::complex<double>;
 
-
-constexpr ALfloat Filter1CoeffSqr[4] = {
-    0.479400865589f, 0.876218493539f, 0.976597589508f, 0.997499255936f
-};
-constexpr ALfloat Filter2CoeffSqr[4] = {
-    0.161758498368f, 0.733028932341f, 0.945349700329f, 0.990599156685f
-};
-
-void allpass_process(AllPassState *state, ALfloat *dst, const ALfloat *src, const ALfloat aa,
-    const size_t todo)
+std::array<float,Uhj2Encoder::sFilterSize> GenerateFilter()
 {
-    ALfloat z1{state->z[0]};
-    ALfloat z2{state->z[1]};
-    auto proc_sample = [aa,&z1,&z2](const ALfloat input) noexcept -> ALfloat
+    /* Some notes on this filter construction.
+     *
+     * A wide-band phase-shift filter needs a delay to maintain linearity. A
+     * dirac impulse in the center of a time-domain buffer represents a filter
+     * passing all frequencies through as-is with a pure delay. Converting that
+     * to the frequency domain, adjusting the phase of each frequency bin by
+     * +90 degrees, then converting back to the time domain, results in a FIR
+     * filter that applies a +90 degree wide-band phase-shift.
+     *
+     * A particularly notable aspect of the time-domain filter response is that
+     * every other coefficient is 0. This allows doubling the effective size of
+     * the filter, by storing only the non-0 coefficients and double-stepping
+     * over the input to apply it.
+     *
+     * Additionally, the resulting filter is independent of the sample rate.
+     * The same filter can be applied regardless of the device's sample rate
+     * and achieve the same effect.
+     */
+    constexpr size_t fft_size{Uhj2Encoder::sFilterSize * 2};
+    constexpr size_t half_size{fft_size / 2};
+
+    /* Generate a frequency domain impulse with a +90 degree phase offset.
+     * Reconstruct the mirrored frequencies to convert to the time domain.
+     */
+    auto fftBuffer = std::make_unique<complex_d[]>(fft_size);
+    std::fill_n(fftBuffer.get(), fft_size, complex_d{});
+    fftBuffer[half_size] = 1.0;
+
+    forward_fft({fftBuffer.get(), fft_size});
+    for(size_t i{0};i < half_size+1;++i)
+        fftBuffer[i] = complex_d{-fftBuffer[i].imag(), fftBuffer[i].real()};
+    for(size_t i{half_size+1};i < fft_size;++i)
+        fftBuffer[i] = std::conj(fftBuffer[fft_size - i]);
+    inverse_fft({fftBuffer.get(), fft_size});
+
+    /* Reverse the filter for simpler processing, and store only the non-0
+     * coefficients.
+     */
+    auto ret = std::make_unique<std::array<float,Uhj2Encoder::sFilterSize>>();
+    auto fftiter = fftBuffer.get() + half_size + (Uhj2Encoder::sFilterSize-1);
+    for(float &coeff : *ret)
     {
-        const ALfloat output{input*aa + z1};
-        z1 = z2; z2 = output*aa - input;
-        return output;
-    };
-    std::transform(src, src+todo, dst, proc_sample);
-    state->z[0] = z1;
-    state->z[1] = z2;
+        coeff = static_cast<float>(fftiter->real() / double{fft_size});
+        fftiter -= 2;
+    }
+    return *ret;
+}
+alignas(16) const auto PShiftCoeffs = GenerateFilter();
+
+
+void allpass_process(al::span<float> dst, const float *RESTRICT src)
+{
+#ifdef HAVE_SSE_INTRINSICS
+    size_t pos{0};
+    if(size_t todo{dst.size()>>1})
+    {
+        do {
+            __m128 r04{_mm_setzero_ps()};
+            __m128 r14{_mm_setzero_ps()};
+            for(size_t j{0};j < PShiftCoeffs.size();j+=4)
+            {
+                const __m128 coeffs{_mm_load_ps(&PShiftCoeffs[j])};
+                const __m128 s0{_mm_loadu_ps(&src[j*2])};
+                const __m128 s1{_mm_loadu_ps(&src[j*2 + 4])};
+
+                __m128 s{_mm_shuffle_ps(s0, s1, _MM_SHUFFLE(2, 0, 2, 0))};
+                r04 = _mm_add_ps(r04, _mm_mul_ps(s, coeffs));
+
+                s = _mm_shuffle_ps(s0, s1, _MM_SHUFFLE(3, 1, 3, 1));
+                r14 = _mm_add_ps(r14, _mm_mul_ps(s, coeffs));
+            }
+            r04 = _mm_add_ps(r04, _mm_shuffle_ps(r04, r04, _MM_SHUFFLE(0, 1, 2, 3)));
+            r04 = _mm_add_ps(r04, _mm_movehl_ps(r04, r04));
+            dst[pos++] += _mm_cvtss_f32(r04);
+
+            r14 = _mm_add_ps(r14, _mm_shuffle_ps(r14, r14, _MM_SHUFFLE(0, 1, 2, 3)));
+            r14 = _mm_add_ps(r14, _mm_movehl_ps(r14, r14));
+            dst[pos++] += _mm_cvtss_f32(r14);
+
+            src += 2;
+        } while(--todo);
+    }
+    if((dst.size()&1))
+    {
+        __m128 r4{_mm_setzero_ps()};
+        for(size_t j{0};j < PShiftCoeffs.size();j+=4)
+        {
+            const __m128 coeffs{_mm_load_ps(&PShiftCoeffs[j])};
+            /* NOTE: This could alternatively be done with two unaligned loads
+             * and a shuffle. Which would be better?
+             */
+            const __m128 s{_mm_setr_ps(src[j*2], src[j*2 + 2], src[j*2 + 4], src[j*2 + 6])};
+            r4 = _mm_add_ps(r4, _mm_mul_ps(s, coeffs));
+        }
+        r4 = _mm_add_ps(r4, _mm_shuffle_ps(r4, r4, _MM_SHUFFLE(0, 1, 2, 3)));
+        r4 = _mm_add_ps(r4, _mm_movehl_ps(r4, r4));
+
+        dst[pos] += _mm_cvtss_f32(r4);
+    }
+
+#else
+
+    for(float &output : dst)
+    {
+        float ret{0.0f};
+        for(size_t j{0};j < PShiftCoeffs.size();++j)
+            ret += src[j*2] * PShiftCoeffs[j];
+
+        output += ret;
+        ++src;
+    }
+#endif
 }
 
 } // namespace
 
 
-/* NOTE: There seems to be a bit of an inconsistency in how this encoding is
- * supposed to work. Some references, such as
+/* Encoding 2-channel UHJ from B-Format is done as:
  *
- * http://members.tripod.com/martin_leese/Ambisonic/UHJ_file_format.html
+ * S = 0.9396926*W + 0.1855740*X
+ * D = j(-0.3420201*W + 0.5098604*X) + 0.6554516*Y
  *
- * specify a pre-scaling of sqrt(2) on the W channel input, while other
- * references, such as
+ * Left = (S + D)/2.0
+ * Right = (S - D)/2.0
  *
- * https://en.wikipedia.org/wiki/Ambisonic_UHJ_format#Encoding.5B1.5D
- * and
- * https://wiki.xiph.org/Ambisonics#UHJ_format
+ * where j is a wide-band +90 degree phase shift.
  *
- * do not. The sqrt(2) scaling is in line with B-Format decoder coefficients
- * which include such a scaling for the W channel input, however the original
- * source for this equation is a 1985 paper by Michael Gerzon, which does not
- * apparently include the scaling. Applying the extra scaling creates a louder
- * result with a narrower stereo image compared to not scaling, and I don't
- * know which is the intended result.
+ * The phase shift is done using a FIR filter derived from an FFT'd impulse
+ * with the desired shift.
  */
 
 void Uhj2Encoder::encode(FloatBufferLine &LeftOut, FloatBufferLine &RightOut,
-    FloatBufferLine *InSamples, const size_t SamplesToDo)
+    const FloatBufferLine *InSamples, const size_t SamplesToDo)
 {
-    alignas(16) ALfloat D[MAX_UPDATE_SAMPLES], S[MAX_UPDATE_SAMPLES];
-    alignas(16) ALfloat temp[MAX_UPDATE_SAMPLES];
-
     ASSUME(SamplesToDo > 0);
 
-    auto winput = InSamples[0].cbegin();
-    auto xinput = InSamples[1].cbegin();
-    auto yinput = InSamples[2].cbegin();
-    for(size_t base{0};base < SamplesToDo;)
-    {
-        const size_t todo{minz(SamplesToDo - base, MAX_UPDATE_SAMPLES)};
-        ASSUME(todo > 0);
+    float *RESTRICT left{al::assume_aligned<16>(LeftOut.data())};
+    float *RESTRICT right{al::assume_aligned<16>(RightOut.data())};
 
-        /* D = 0.6554516*Y */
-        std::transform(yinput, yinput+todo, std::begin(temp),
-            [](const float y) noexcept -> float { return 0.6554516f*y; });
-        allpass_process(&mFilter1_Y[0], temp, temp, Filter1CoeffSqr[0], todo);
-        allpass_process(&mFilter1_Y[1], temp, temp, Filter1CoeffSqr[1], todo);
-        allpass_process(&mFilter1_Y[2], temp, temp, Filter1CoeffSqr[2], todo);
-        allpass_process(&mFilter1_Y[3], temp, temp, Filter1CoeffSqr[3], todo);
-        /* NOTE: Filter1 requires a 1 sample delay for the final output, so
-         * take the last processed sample from the previous run as the first
-         * output sample.
-         */
-        D[0] = mLastY;
-        for(size_t i{1};i < todo;i++)
-            D[i] = temp[i-1];
-        mLastY = temp[todo-1];
+    const float *RESTRICT winput{al::assume_aligned<16>(InSamples[0].data())};
+    const float *RESTRICT xinput{al::assume_aligned<16>(InSamples[1].data())};
+    const float *RESTRICT yinput{al::assume_aligned<16>(InSamples[2].data())};
 
-        /* D += j(-0.3420201*W + 0.5098604*X) */
-        std::transform(winput, winput+todo, xinput, std::begin(temp),
-            [](const float w, const float x) noexcept -> float
-            { return -0.3420201f*w + 0.5098604f*x; });
-        allpass_process(&mFilter2_WX[0], temp, temp, Filter2CoeffSqr[0], todo);
-        allpass_process(&mFilter2_WX[1], temp, temp, Filter2CoeffSqr[1], todo);
-        allpass_process(&mFilter2_WX[2], temp, temp, Filter2CoeffSqr[2], todo);
-        allpass_process(&mFilter2_WX[3], temp, temp, Filter2CoeffSqr[3], todo);
-        for(size_t i{0};i < todo;i++)
-            D[i] += temp[i];
+    /* Combine the previously delayed mid/side signal with the input. */
 
-        /* S = 0.9396926*W + 0.1855740*X */
-        std::transform(winput, winput+todo, xinput, std::begin(temp),
-            [](const float w, const float x) noexcept -> float
-            { return 0.9396926f*w + 0.1855740f*x; });
-        allpass_process(&mFilter1_WX[0], temp, temp, Filter1CoeffSqr[0], todo);
-        allpass_process(&mFilter1_WX[1], temp, temp, Filter1CoeffSqr[1], todo);
-        allpass_process(&mFilter1_WX[2], temp, temp, Filter1CoeffSqr[2], todo);
-        allpass_process(&mFilter1_WX[3], temp, temp, Filter1CoeffSqr[3], todo);
-        S[0] = mLastWX;
-        for(size_t i{1};i < todo;i++)
-            S[i] = temp[i-1];
-        mLastWX = temp[todo-1];
+    /* S = 0.9396926*W + 0.1855740*X */
+    auto miditer = std::copy(mMidDelay.cbegin(), mMidDelay.cend(), mMid.begin());
+    std::transform(winput, winput+SamplesToDo, xinput, miditer,
+        [](const float w, const float x) noexcept -> float
+        { return 0.9396926f*w + 0.1855740f*x; });
 
-        /* Left = (S + D)/2.0 */
-        ALfloat *RESTRICT left = al::assume_aligned<16>(LeftOut.data()+base);
-        for(size_t i{0};i < todo;i++)
-            left[i] += (S[i] + D[i]) * 0.5f;
-        /* Right = (S - D)/2.0 */
-        ALfloat *RESTRICT right = al::assume_aligned<16>(RightOut.data()+base);
-        for(size_t i{0};i < todo;i++)
-            right[i] += (S[i] - D[i]) * 0.5f;
+    /* D = 0.6554516*Y */
+    auto sideiter = std::copy(mSideDelay.cbegin(), mSideDelay.cend(), mSide.begin());
+    std::transform(yinput, yinput+SamplesToDo, sideiter,
+        [](const float y) noexcept -> float { return 0.6554516f*y; });
 
-        winput += todo;
-        xinput += todo;
-        yinput += todo;
-        base += todo;
-    }
+    /* Include any existing direct signal in the mid/side buffers. */
+    for(size_t i{0};i < SamplesToDo;++i,++miditer)
+        *miditer += left[i] + right[i];
+    for(size_t i{0};i < SamplesToDo;++i,++sideiter)
+        *sideiter += left[i] - right[i];
+
+    /* Copy the future samples back to the delay buffers for next time. */
+    std::copy_n(mMid.cbegin()+SamplesToDo, mMidDelay.size(), mMidDelay.begin());
+    std::copy_n(mSide.cbegin()+SamplesToDo, mSideDelay.size(), mSideDelay.begin());
+
+    /* Now add the all-passed signal into the side signal. */
+
+    /* D += j(-0.3420201*W + 0.5098604*X) */
+    auto tmpiter = std::copy(mSideHistory.cbegin(), mSideHistory.cend(), mTemp.begin());
+    std::transform(winput, winput+SamplesToDo, xinput, tmpiter,
+        [](const float w, const float x) noexcept -> float
+        { return -0.3420201f*w + 0.5098604f*x; });
+    std::copy_n(mTemp.cbegin()+SamplesToDo, mSideHistory.size(), mSideHistory.begin());
+    allpass_process({mSide.data(), SamplesToDo}, mTemp.data());
+
+    /* Left = (S + D)/2.0 */
+    for(size_t i{0};i < SamplesToDo;i++)
+        left[i] = (mMid[i] + mSide[i]) * 0.5f;
+    /* Right = (S - D)/2.0 */
+    for(size_t i{0};i < SamplesToDo;i++)
+        right[i] = (mMid[i] - mSide[i]) * 0.5f;
 }

@@ -9,14 +9,24 @@
 #include "alcmain.h"
 
 #include "alu.h"
+#include "bsinc_defs.h"
 #include "defs.h"
 #include "hrtfbase.h"
+
+struct SSETag;
+struct BSincTag;
+struct FastBSincTag;
 
 
 namespace {
 
-inline void ApplyCoeffs(float2 *RESTRICT Values, const ALuint IrSize, const HrirArray &Coeffs,
-    const float left, const float right)
+constexpr ALuint FracPhaseBitDiff{MixerFracBits - BSincPhaseBits};
+constexpr ALuint FracPhaseDiffOne{1 << FracPhaseBitDiff};
+
+#define MLA4(x, y, z) _mm_add_ps(x, _mm_mul_ps(y, z))
+
+inline void ApplyCoeffs(float2 *RESTRICT Values, const uint_fast32_t IrSize,
+    const HrirArray &Coeffs, const float left, const float right)
 {
     const __m128 lrlr{_mm_setr_ps(left, right, left, right)};
 
@@ -33,7 +43,7 @@ inline void ApplyCoeffs(float2 *RESTRICT Values, const ALuint IrSize, const Hrir
         imp0 = _mm_mul_ps(lrlr, coeffs);
         vals = _mm_add_ps(imp0, vals);
         _mm_storel_pi(reinterpret_cast<__m64*>(&Values[0][0]), vals);
-        ALuint td{(IrSize>>1) - 1};
+        uint_fast32_t td{((IrSize+1)>>1) - 1};
         size_t i{1};
         do {
             coeffs = _mm_load_ps(&Coeffs[i+1][0]);
@@ -56,7 +66,7 @@ inline void ApplyCoeffs(float2 *RESTRICT Values, const ALuint IrSize, const Hrir
         {
             const __m128 coeffs{_mm_load_ps(&Coeffs[i][0])};
             __m128 vals{_mm_load_ps(&Values[i][0])};
-            vals = _mm_add_ps(vals, _mm_mul_ps(lrlr, coeffs));
+            vals = MLA4(vals, lrlr, coeffs);
             _mm_store_ps(&Values[i][0], vals);
         }
     }
@@ -65,7 +75,7 @@ inline void ApplyCoeffs(float2 *RESTRICT Values, const ALuint IrSize, const Hrir
 } // namespace
 
 template<>
-const ALfloat *Resample_<BSincTag,SSETag>(const InterpState *state, const ALfloat *RESTRICT src,
+const float *Resample_<BSincTag,SSETag>(const InterpState *state, const float *RESTRICT src,
     ALuint frac, ALuint increment, const al::span<float> dst)
 {
     const float *const filter{state->bsinc.filter};
@@ -76,11 +86,8 @@ const ALfloat *Resample_<BSincTag,SSETag>(const InterpState *state, const ALfloa
     for(float &out_sample : dst)
     {
         // Calculate the phase index and factor.
-#define FRAC_PHASE_BITDIFF (FRACTIONBITS-BSINC_PHASE_BITS)
-        const ALuint pi{frac >> FRAC_PHASE_BITDIFF};
-        const float pf{static_cast<float>(frac & ((1<<FRAC_PHASE_BITDIFF)-1)) *
-            (1.0f/(1<<FRAC_PHASE_BITDIFF))};
-#undef FRAC_PHASE_BITDIFF
+        const ALuint pi{frac >> FracPhaseBitDiff};
+        const float pf{static_cast<float>(frac & (FracPhaseDiffOne-1)) * (1.0f/FracPhaseDiffOne)};
 
         // Apply the scale and phase interpolated filter.
         __m128 r4{_mm_setzero_ps()};
@@ -93,33 +100,30 @@ const ALfloat *Resample_<BSincTag,SSETag>(const InterpState *state, const ALfloa
             size_t td{m >> 2};
             size_t j{0u};
 
-#define MLA4(x, y, z) _mm_add_ps(x, _mm_mul_ps(y, z))
             do {
                 /* f = ((fil + sf*scd) + pf*(phd + sf*spd)) */
                 const __m128 f4 = MLA4(
-                    MLA4(_mm_load_ps(fil), sf4, _mm_load_ps(scd)),
-                    pf4, MLA4(_mm_load_ps(phd), sf4, _mm_load_ps(spd)));
-                fil += 4; scd += 4; phd += 4; spd += 4;
+                    MLA4(_mm_load_ps(&fil[j]), sf4, _mm_load_ps(&scd[j])),
+                    pf4, MLA4(_mm_load_ps(&phd[j]), sf4, _mm_load_ps(&spd[j])));
                 /* r += f*src */
                 r4 = MLA4(r4, f4, _mm_loadu_ps(&src[j]));
                 j += 4;
             } while(--td);
-#undef MLA4
         }
         r4 = _mm_add_ps(r4, _mm_shuffle_ps(r4, r4, _MM_SHUFFLE(0, 1, 2, 3)));
         r4 = _mm_add_ps(r4, _mm_movehl_ps(r4, r4));
         out_sample = _mm_cvtss_f32(r4);
 
         frac += increment;
-        src  += frac>>FRACTIONBITS;
-        frac &= FRACTIONMASK;
+        src  += frac>>MixerFracBits;
+        frac &= MixerFracMask;
     }
-    return dst.begin();
+    return dst.data();
 }
 
 template<>
-const ALfloat *Resample_<FastBSincTag,SSETag>(const InterpState *state,
-    const ALfloat *RESTRICT src, ALuint frac, ALuint increment, const al::span<float> dst)
+const float *Resample_<FastBSincTag,SSETag>(const InterpState *state, const float *RESTRICT src,
+    ALuint frac, ALuint increment, const al::span<float> dst)
 {
     const float *const filter{state->bsinc.filter};
     const size_t m{state->bsinc.m};
@@ -128,11 +132,8 @@ const ALfloat *Resample_<FastBSincTag,SSETag>(const InterpState *state,
     for(float &out_sample : dst)
     {
         // Calculate the phase index and factor.
-#define FRAC_PHASE_BITDIFF (FRACTIONBITS-BSINC_PHASE_BITS)
-        const ALuint pi{frac >> FRAC_PHASE_BITDIFF};
-        const float pf{static_cast<float>(frac & ((1<<FRAC_PHASE_BITDIFF)-1)) *
-            (1.0f/(1<<FRAC_PHASE_BITDIFF))};
-#undef FRAC_PHASE_BITDIFF
+        const ALuint pi{frac >> FracPhaseBitDiff};
+        const float pf{static_cast<float>(frac & (FracPhaseDiffOne-1)) * (1.0f/FracPhaseDiffOne)};
 
         // Apply the phase interpolated filter.
         __m128 r4{_mm_setzero_ps()};
@@ -143,25 +144,23 @@ const ALfloat *Resample_<FastBSincTag,SSETag>(const InterpState *state,
             size_t td{m >> 2};
             size_t j{0u};
 
-#define MLA4(x, y, z) _mm_add_ps(x, _mm_mul_ps(y, z))
             do {
                 /* f = fil + pf*phd */
-                const __m128 f4 = MLA4(_mm_load_ps(fil), pf4, _mm_load_ps(phd));
+                const __m128 f4 = MLA4(_mm_load_ps(&fil[j]), pf4, _mm_load_ps(&phd[j]));
                 /* r += f*src */
                 r4 = MLA4(r4, f4, _mm_loadu_ps(&src[j]));
-                fil += 4; phd += 4; j += 4;
+                j += 4;
             } while(--td);
-#undef MLA4
         }
         r4 = _mm_add_ps(r4, _mm_shuffle_ps(r4, r4, _MM_SHUFFLE(0, 1, 2, 3)));
         r4 = _mm_add_ps(r4, _mm_movehl_ps(r4, r4));
         out_sample = _mm_cvtss_f32(r4);
 
         frac += increment;
-        src  += frac>>FRACTIONBITS;
-        frac &= FRACTIONMASK;
+        src  += frac>>MixerFracBits;
+        frac &= MixerFracMask;
     }
-    return dst.begin();
+    return dst.data();
 }
 
 
@@ -189,39 +188,39 @@ template<>
 void Mix_<SSETag>(const al::span<const float> InSamples, const al::span<FloatBufferLine> OutBuffer,
     float *CurrentGains, const float *TargetGains, const size_t Counter, const size_t OutPos)
 {
-    const ALfloat delta{(Counter > 0) ? 1.0f / static_cast<ALfloat>(Counter) : 0.0f};
-    const bool reached_target{InSamples.size() >= Counter};
-    const auto min_end = reached_target ? InSamples.begin() + Counter : InSamples.end();
-    const auto aligned_end = minz(static_cast<uintptr_t>(min_end-InSamples.begin()+3) & ~3u,
-        InSamples.size()) + InSamples.begin();
+    const float delta{(Counter > 0) ? 1.0f / static_cast<float>(Counter) : 0.0f};
+    const auto min_len = minz(Counter, InSamples.size());
+    const auto aligned_len = minz((min_len+3) & ~size_t{3}, InSamples.size()) - min_len;
+
     for(FloatBufferLine &output : OutBuffer)
     {
-        ALfloat *RESTRICT dst{al::assume_aligned<16>(output.data()+OutPos)};
-        ALfloat gain{*CurrentGains};
-        const ALfloat diff{*TargetGains - gain};
+        float *RESTRICT dst{al::assume_aligned<16>(output.data()+OutPos)};
+        float gain{*CurrentGains};
+        const float step{(*TargetGains-gain) * delta};
 
-        auto in_iter = InSamples.begin();
-        if(std::fabs(diff) > std::numeric_limits<float>::epsilon())
+        size_t pos{0};
+        if(!(std::fabs(step) > std::numeric_limits<float>::epsilon()))
+            gain = *TargetGains;
+        else
         {
-            const ALfloat step{diff * delta};
-            ALfloat step_count{0.0f};
+            float step_count{0.0f};
             /* Mix with applying gain steps in aligned multiples of 4. */
-            if(ptrdiff_t todo{(min_end-in_iter) >> 2})
+            if(size_t todo{(min_len-pos) >> 2})
             {
                 const __m128 four4{_mm_set1_ps(4.0f)};
                 const __m128 step4{_mm_set1_ps(step)};
                 const __m128 gain4{_mm_set1_ps(gain)};
                 __m128 step_count4{_mm_setr_ps(0.0f, 1.0f, 2.0f, 3.0f)};
                 do {
-                    const __m128 val4{_mm_load_ps(in_iter)};
-                    __m128 dry4{_mm_load_ps(dst)};
-#define MLA4(x, y, z) _mm_add_ps(x, _mm_mul_ps(y, z))
+                    const __m128 val4{_mm_load_ps(&InSamples[pos])};
+                    __m128 dry4{_mm_load_ps(&dst[pos])};
+
                     /* dry += val * (gain + step*step_count) */
                     dry4 = MLA4(dry4, val4, MLA4(gain4, step4, step_count4));
-#undef MLA4
-                    _mm_store_ps(dst, dry4);
+
+                    _mm_store_ps(&dst[pos], dry4);
                     step_count4 = _mm_add_ps(step_count4, four4);
-                    in_iter += 4; dst += 4;
+                    pos += 4;
                 } while(--todo);
                 /* NOTE: step_count4 now represents the next four counts after
                  * the last four mixed samples, so the lowest element
@@ -230,69 +229,38 @@ void Mix_<SSETag>(const al::span<const float> InSamples, const al::span<FloatBuf
                 step_count = _mm_cvtss_f32(step_count4);
             }
             /* Mix with applying left over gain steps that aren't aligned multiples of 4. */
-            while(in_iter != min_end)
+            for(size_t leftover{min_len&3};leftover;++pos,--leftover)
             {
-                *(dst++) += *(in_iter++) * (gain + step*step_count);
+                dst[pos] += InSamples[pos] * (gain + step*step_count);
                 step_count += 1.0f;
             }
-            if(reached_target)
+            if(pos == Counter)
                 gain = *TargetGains;
             else
                 gain += step*step_count;
-            *CurrentGains = gain;
 
             /* Mix until pos is aligned with 4 or the mix is done. */
-            while(in_iter != aligned_end)
-                *(dst++) += *(in_iter++) * gain;
+            for(size_t leftover{aligned_len&3};leftover;++pos,--leftover)
+                dst[pos] += InSamples[pos] * gain;
         }
+        *CurrentGains = gain;
         ++CurrentGains;
         ++TargetGains;
 
-        if(!(std::fabs(gain) > GAIN_SILENCE_THRESHOLD))
+        if(!(std::fabs(gain) > GainSilenceThreshold))
             continue;
-        if(ptrdiff_t todo{(InSamples.end()-in_iter) >> 2})
+        if(size_t todo{(InSamples.size()-pos) >> 2})
         {
             const __m128 gain4{_mm_set1_ps(gain)};
             do {
-                const __m128 val4{_mm_load_ps(in_iter)};
-                __m128 dry4{_mm_load_ps(dst)};
+                const __m128 val4{_mm_load_ps(&InSamples[pos])};
+                __m128 dry4{_mm_load_ps(&dst[pos])};
                 dry4 = _mm_add_ps(dry4, _mm_mul_ps(val4, gain4));
-                _mm_store_ps(dst, dry4);
-                in_iter += 4; dst += 4;
+                _mm_store_ps(&dst[pos], dry4);
+                pos += 4;
             } while(--todo);
         }
-        while(in_iter != InSamples.end())
-            *(dst++) += *(in_iter++) * gain;
-    }
-}
-
-template<>
-void MixRow_<SSETag>(const al::span<float> OutBuffer, const al::span<const float> Gains,
-    const float *InSamples, const size_t InStride)
-{
-    for(const float gain : Gains)
-    {
-        const float *RESTRICT input{InSamples};
-        InSamples += InStride;
-
-        if(!(std::fabs(gain) > GAIN_SILENCE_THRESHOLD))
-            continue;
-
-        auto out_iter = OutBuffer.begin();
-        if(size_t todo{OutBuffer.size() >> 2})
-        {
-            const __m128 gain4 = _mm_set1_ps(gain);
-            do {
-                const __m128 val4{_mm_load_ps(input)};
-                __m128 dry4{_mm_load_ps(out_iter)};
-                dry4 = _mm_add_ps(dry4, _mm_mul_ps(val4, gain4));
-                _mm_store_ps(out_iter, dry4);
-                out_iter += 4; input += 4;
-            } while(--todo);
-        }
-
-        auto do_mix = [gain](const float cur, const float src) noexcept -> float
-        { return cur + src*gain; };
-        std::transform(out_iter, OutBuffer.end(), input, out_iter, do_mix);
+        for(size_t leftover{(InSamples.size()-pos)&3};leftover;++pos,--leftover)
+            dst[pos] += InSamples[pos] * gain;
     }
 }

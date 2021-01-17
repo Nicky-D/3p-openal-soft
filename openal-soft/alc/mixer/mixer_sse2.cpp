@@ -26,14 +26,17 @@
 #include "alu.h"
 #include "defs.h"
 
+struct SSE2Tag;
+struct LerpTag;
+
 
 template<>
-const ALfloat *Resample_<LerpTag,SSE2Tag>(const InterpState*, const ALfloat *RESTRICT src,
-    ALuint frac, ALuint increment, const al::span<float> dst)
+const float *Resample_<LerpTag,SSE2Tag>(const InterpState*, const float *RESTRICT src, ALuint frac,
+    ALuint increment, const al::span<float> dst)
 {
     const __m128i increment4{_mm_set1_epi32(static_cast<int>(increment*4))};
-    const __m128 fracOne4{_mm_set1_ps(1.0f/FRACTIONONE)};
-    const __m128i fracMask4{_mm_set1_epi32(FRACTIONMASK)};
+    const __m128 fracOne4{_mm_set1_ps(1.0f/MixerFracOne)};
+    const __m128i fracMask4{_mm_set1_epi32(MixerFracMask)};
 
     alignas(16) ALuint pos_[4], frac_[4];
     InitPosArrays(frac, increment, frac_, pos_, 4);
@@ -43,8 +46,7 @@ const ALfloat *Resample_<LerpTag,SSE2Tag>(const InterpState*, const ALfloat *RES
         static_cast<int>(pos_[2]), static_cast<int>(pos_[3]))};
 
     auto dst_iter = dst.begin();
-    const auto aligned_end = (dst.size()&~3u) + dst_iter;
-    while(dst_iter != aligned_end)
+    for(size_t todo{dst.size()>>2};todo;--todo)
     {
         const int pos0{_mm_cvtsi128_si32(_mm_shuffle_epi32(pos4, _MM_SHUFFLE(0, 0, 0, 0)))};
         const int pos1{_mm_cvtsi128_si32(_mm_shuffle_epi32(pos4, _MM_SHUFFLE(1, 1, 1, 1)))};
@@ -62,22 +64,22 @@ const ALfloat *Resample_<LerpTag,SSE2Tag>(const InterpState*, const ALfloat *RES
         dst_iter += 4;
 
         frac4 = _mm_add_epi32(frac4, increment4);
-        pos4 = _mm_add_epi32(pos4, _mm_srli_epi32(frac4, FRACTIONBITS));
+        pos4 = _mm_add_epi32(pos4, _mm_srli_epi32(frac4, MixerFracBits));
         frac4 = _mm_and_si128(frac4, fracMask4);
     }
 
-    if(dst_iter != dst.end())
+    if(size_t todo{dst.size()&3})
     {
         src += static_cast<ALuint>(_mm_cvtsi128_si32(pos4));
         frac = static_cast<ALuint>(_mm_cvtsi128_si32(frac4));
 
         do {
-            *(dst_iter++) = lerp(src[0], src[1], static_cast<float>(frac) * (1.0f/FRACTIONONE));
+            *(dst_iter++) = lerp(src[0], src[1], static_cast<float>(frac) * (1.0f/MixerFracOne));
 
             frac += increment;
-            src  += frac>>FRACTIONBITS;
-            frac &= FRACTIONMASK;
-        } while(dst_iter != dst.end());
+            src  += frac>>MixerFracBits;
+            frac &= MixerFracMask;
+        } while(--todo);
     }
-    return dst.begin();
+    return dst.data();
 }
