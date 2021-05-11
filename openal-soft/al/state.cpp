@@ -33,16 +33,17 @@
 #include "AL/alext.h"
 
 #include "alcontext.h"
-#include "alexcpt.h"
 #include "almalloc.h"
 #include "alnumeric.h"
 #include "alspan.h"
 #include "alu.h"
 #include "atomic.h"
+#include "core/except.h"
 #include "event.h"
 #include "inprogext.h"
 #include "opthelpers.h"
 #include "strutils.h"
+#include "voice.h"
 
 
 namespace {
@@ -92,6 +93,35 @@ const ALchar *GetResamplerName(const Resampler rtype)
 #undef HANDLE_RESAMPLER
     /* Should never get here. */
     throw std::runtime_error{"Unexpected resampler index"};
+}
+
+al::optional<DistanceModel> DistanceModelFromALenum(ALenum model)
+{
+    switch(model)
+    {
+    case AL_NONE: return al::make_optional(DistanceModel::Disable);
+    case AL_INVERSE_DISTANCE: return al::make_optional(DistanceModel::Inverse);
+    case AL_INVERSE_DISTANCE_CLAMPED: return al::make_optional(DistanceModel::InverseClamped);
+    case AL_LINEAR_DISTANCE: return al::make_optional(DistanceModel::Linear);
+    case AL_LINEAR_DISTANCE_CLAMPED: return al::make_optional(DistanceModel::LinearClamped);
+    case AL_EXPONENT_DISTANCE: return al::make_optional(DistanceModel::Exponent);
+    case AL_EXPONENT_DISTANCE_CLAMPED: return al::make_optional(DistanceModel::ExponentClamped);
+    }
+    return al::nullopt;
+}
+ALenum ALenumFromDistanceModel(DistanceModel model)
+{
+    switch(model)
+    {
+    case DistanceModel::Disable: return AL_NONE;
+    case DistanceModel::Inverse: return AL_INVERSE_DISTANCE;
+    case DistanceModel::InverseClamped: return AL_INVERSE_DISTANCE_CLAMPED;
+    case DistanceModel::Linear: return AL_LINEAR_DISTANCE;
+    case DistanceModel::LinearClamped: return AL_LINEAR_DISTANCE_CLAMPED;
+    case DistanceModel::Exponent: return AL_EXPONENT_DISTANCE;
+    case DistanceModel::ExponentClamped: return AL_EXPONENT_DISTANCE_CLAMPED;
+    }
+    throw std::runtime_error{"Unexpected distance model "+std::to_string(static_cast<int>(model))};
 }
 
 } // namespace
@@ -254,7 +284,7 @@ START_API_FUNC
         break;
 
     case AL_DISTANCE_MODEL:
-        value = static_cast<ALdouble>(context->mDistanceModel);
+        value = static_cast<ALdouble>(ALenumFromDistanceModel(context->mDistanceModel));
         break;
 
     case AL_SPEED_OF_SOUND:
@@ -305,7 +335,7 @@ START_API_FUNC
         break;
 
     case AL_DISTANCE_MODEL:
-        value = static_cast<ALfloat>(context->mDistanceModel);
+        value = static_cast<ALfloat>(ALenumFromDistanceModel(context->mDistanceModel));
         break;
 
     case AL_SPEED_OF_SOUND:
@@ -356,7 +386,7 @@ START_API_FUNC
         break;
 
     case AL_DISTANCE_MODEL:
-        value = static_cast<ALint>(context->mDistanceModel);
+        value = ALenumFromDistanceModel(context->mDistanceModel);
         break;
 
     case AL_SPEED_OF_SOUND:
@@ -407,7 +437,7 @@ START_API_FUNC
         break;
 
     case AL_DISTANCE_MODEL:
-        value = static_cast<ALint64SOFT>(context->mDistanceModel);
+        value = ALenumFromDistanceModel(context->mDistanceModel);
         break;
 
     case AL_SPEED_OF_SOUND:
@@ -770,18 +800,15 @@ START_API_FUNC
     ContextRef context{GetContextRef()};
     if UNLIKELY(!context) return;
 
-    if(!(value == AL_INVERSE_DISTANCE || value == AL_INVERSE_DISTANCE_CLAMPED ||
-         value == AL_LINEAR_DISTANCE || value == AL_LINEAR_DISTANCE_CLAMPED ||
-         value == AL_EXPONENT_DISTANCE || value == AL_EXPONENT_DISTANCE_CLAMPED ||
-         value == AL_NONE))
-        context->setError(AL_INVALID_VALUE, "Distance model 0x%04x out of range", value);
-    else
+    if(auto model = DistanceModelFromALenum(value))
     {
         std::lock_guard<std::mutex> _{context->mPropLock};
-        context->mDistanceModel = static_cast<DistanceModel>(value);
+        context->mDistanceModel = *model;
         if(!context->mSourceDistanceModel)
             DO_UPDATEPROPS();
     }
+    else
+        context->setError(AL_INVALID_VALUE, "Distance model 0x%04x out of range", value);
 }
 END_API_FUNC
 
@@ -834,12 +861,12 @@ END_API_FUNC
 void UpdateContextProps(ALCcontext *context)
 {
     /* Get an unused proprty container, or allocate a new one as needed. */
-    ALcontextProps *props{context->mFreeContextProps.load(std::memory_order_acquire)};
+    ContextProps *props{context->mFreeContextProps.load(std::memory_order_acquire)};
     if(!props)
-        props = new ALcontextProps{};
+        props = new ContextProps{};
     else
     {
-        ALcontextProps *next;
+        ContextProps *next;
         do {
             next = props->next.load(std::memory_order_relaxed);
         } while(context->mFreeContextProps.compare_exchange_weak(props, next,
@@ -855,7 +882,7 @@ void UpdateContextProps(ALCcontext *context)
     props->mDistanceModel = context->mDistanceModel;
 
     /* Set the new container for updating internal parameters. */
-    props = context->mUpdate.exchange(props, std::memory_order_acq_rel);
+    props = context->mParams.ContextUpdate.exchange(props, std::memory_order_acq_rel);
     if(props)
     {
         /* If there was an unused update container, put it back in the

@@ -1,13 +1,12 @@
-#ifndef ALC_BUFFER_FORMATS_H
-#define ALC_BUFFER_FORMATS_H
+#ifndef ALC_BUFFER_STORAGE_H
+#define ALC_BUFFER_STORAGE_H
 
-#include "AL/al.h"
-#include "AL/alext.h"
+#include <atomic>
 
 #include "albyte.h"
-#include "inprogext.h"
-#include "vector.h"
 
+
+using uint = unsigned int;
 
 /* Storable formats */
 enum FmtType : unsigned char {
@@ -31,43 +30,43 @@ enum FmtChannels : unsigned char {
 };
 
 enum class AmbiLayout : unsigned char {
-    FuMa = AL_FUMA_SOFT,
-    ACN = AL_ACN_SOFT,
+    FuMa,
+    ACN,
 };
 enum class AmbiScaling : unsigned char {
-    FuMa = AL_FUMA_SOFT,
-    SN3D = AL_SN3D_SOFT,
-    N3D = AL_N3D_SOFT,
+    FuMa,
+    SN3D,
+    N3D,
 };
 
-ALuint BytesFromFmt(FmtType type) noexcept;
-ALuint ChannelsFromFmt(FmtChannels chans, ALuint ambiorder) noexcept;
-inline ALuint FrameSizeFromFmt(FmtChannels chans, FmtType type, ALuint ambiorder) noexcept
+uint BytesFromFmt(FmtType type) noexcept;
+uint ChannelsFromFmt(FmtChannels chans, uint ambiorder) noexcept;
+inline uint FrameSizeFromFmt(FmtChannels chans, FmtType type, uint ambiorder) noexcept
 { return ChannelsFromFmt(chans, ambiorder) * BytesFromFmt(type); }
 
 
-struct BufferStorage {
-    al::vector<al::byte,16> mData;
+using CallbackType = int(*)(void*, void*, int);
 
-    LPALBUFFERCALLBACKTYPESOFT mCallback{nullptr};
+struct BufferStorage {
+    CallbackType mCallback{nullptr};
     void *mUserData{nullptr};
 
-    ALuint mSampleRate{0u};
-    FmtChannels mChannels{};
-    FmtType mType{};
-    ALuint mSampleLen{0u};
+    uint mSampleRate{0u};
+    FmtChannels mChannels{FmtMono};
+    FmtType mType{FmtShort};
+    uint mSampleLen{0u};
 
     AmbiLayout mAmbiLayout{AmbiLayout::FuMa};
     AmbiScaling mAmbiScaling{AmbiScaling::FuMa};
-    ALuint mAmbiOrder{0u};
+    uint mAmbiOrder{0u};
 
-    inline ALuint bytesFromFmt() const noexcept { return BytesFromFmt(mType); }
-    inline ALuint channelsFromFmt() const noexcept
+    inline uint bytesFromFmt() const noexcept { return BytesFromFmt(mType); }
+    inline uint channelsFromFmt() const noexcept
     { return ChannelsFromFmt(mChannels, mAmbiOrder); }
-    inline ALuint frameSizeFromFmt() const noexcept { return channelsFromFmt() * bytesFromFmt(); }
+    inline uint frameSizeFromFmt() const noexcept { return channelsFromFmt() * bytesFromFmt(); }
 
     inline bool isBFormat() const noexcept
     { return mChannels == FmtBFormat2D || mChannels == FmtBFormat3D; }
 };
 
-#endif /* ALC_BUFFER_FORMATS_H */
+#endif /* ALC_BUFFER_STORAGE_H */

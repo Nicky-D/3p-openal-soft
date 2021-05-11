@@ -6,16 +6,19 @@
 #include <cstddef>
 #include <iterator>
 #include <limits>
+#include <deque>
 
 #include "AL/al.h"
 #include "AL/alc.h"
 
 #include "alcontext.h"
+#include "aldeque.h"
 #include "almalloc.h"
 #include "alnumeric.h"
 #include "alu.h"
 #include "math_defs.h"
 #include "vector.h"
+#include "voice.h"
 
 struct ALbuffer;
 struct ALeffectslot;
@@ -25,12 +28,10 @@ struct ALeffectslot;
 
 #define INVALID_VOICE_IDX static_cast<ALuint>(-1)
 
-struct ALbufferlistitem {
-    std::atomic<ALbufferlistitem*> mNext{nullptr};
-    ALuint mSampleLen{0u};
+struct ALbufferQueueItem : public VoiceBufferItem {
     ALbuffer *mBuffer{nullptr};
 
-    DEF_NEWDEL(ALbufferlistitem)
+    DISABLE_ALLOC()
 };
 
 
@@ -106,7 +107,7 @@ struct ALsource {
     ALenum state{AL_INITIAL};
 
     /** Source Buffer Queue head. */
-    ALbufferlistitem *queue{nullptr};
+    al::deque<ALbufferQueueItem> mQueue;
 
     std::atomic_flag PropsClean;
 

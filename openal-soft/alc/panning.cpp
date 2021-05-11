@@ -47,28 +47,17 @@
 #include "alspan.h"
 #include "alstring.h"
 #include "alu.h"
-#include "ambdec.h"
-#include "ambidefs.h"
 #include "bformatdec.h"
-#include "bs2b.h"
-#include "devformat.h"
+#include "core/ambdec.h"
+#include "core/ambidefs.h"
+#include "core/bs2b.h"
+#include "core/devformat.h"
+#include "core/logging.h"
+#include "core/uhjfilter.h"
 #include "front_stablizer.h"
 #include "hrtf.h"
-#include "logging.h"
 #include "math_defs.h"
 #include "opthelpers.h"
-#include "uhjfilter.h"
-
-
-constexpr std::array<float,MAX_AMBI_CHANNELS> AmbiScale::FromN3D;
-constexpr std::array<float,MAX_AMBI_CHANNELS> AmbiScale::FromSN3D;
-constexpr std::array<float,MAX_AMBI_CHANNELS> AmbiScale::FromFuMa;
-constexpr std::array<uint8_t,MAX_AMBI_CHANNELS> AmbiIndex::FromFuMa;
-constexpr std::array<uint8_t,MAX_AMBI2D_CHANNELS> AmbiIndex::FromFuMa2D;
-constexpr std::array<uint8_t,MAX_AMBI_CHANNELS> AmbiIndex::FromACN;
-constexpr std::array<uint8_t,MAX_AMBI2D_CHANNELS> AmbiIndex::From2D;
-constexpr std::array<uint8_t,MAX_AMBI_CHANNELS> AmbiIndex::OrderFromChannel;
-constexpr std::array<uint8_t,MAX_AMBI2D_CHANNELS> AmbiIndex::OrderFrom2DChannel;
 
 
 namespace {
@@ -105,7 +94,7 @@ inline const char *GetLabelFromChannel(Channel channel)
 }
 
 
-std::unique_ptr<FrontStablizer> CreateStablizer(const size_t outchans, const ALuint srate)
+std::unique_ptr<FrontStablizer> CreateStablizer(const size_t outchans, const uint srate)
 {
     auto stablizer = FrontStablizer::Create(outchans);
     for(auto &buf : stablizer->DelayBuf)
@@ -145,12 +134,12 @@ void AllocChannels(ALCdevice *device, const size_t main_chans, const size_t real
 
 struct ChannelMap {
     Channel ChanName;
-    float Config[MAX_AMBI2D_CHANNELS];
+    float Config[MaxAmbi2DChannels];
 };
 
-bool MakeSpeakerMap(ALCdevice *device, const AmbDecConf *conf, ALuint (&speakermap)[MAX_OUTPUT_CHANNELS])
+bool MakeSpeakerMap(ALCdevice *device, const AmbDecConf *conf, uint (&speakermap)[MAX_OUTPUT_CHANNELS])
 {
-    auto map_spkr = [device](const AmbDecConf::SpeakerConf &speaker) -> ALuint
+    auto map_spkr = [device](const AmbDecConf::SpeakerConf &speaker) -> uint
     {
         /* NOTE: AmbDec does not define any standard speaker names, however
          * for this to work we have to by able to find the output channel
@@ -214,22 +203,23 @@ bool MakeSpeakerMap(ALCdevice *device, const AmbDecConf *conf, ALuint (&speakerm
             ERR("AmbDec speaker label \"%s\" not recognized\n", speaker.Name.c_str());
             return INVALID_CHANNEL_INDEX;
         }
-        const ALuint chidx{GetChannelIdxByName(device->RealOut, ch)};
+        const uint chidx{GetChannelIdxByName(device->RealOut, ch)};
         if(chidx == INVALID_CHANNEL_INDEX)
             ERR("Failed to lookup AmbDec speaker label %s\n", speaker.Name.c_str());
         return chidx;
     };
-    std::transform(conf->Speakers.begin(), conf->Speakers.end(), std::begin(speakermap), map_spkr);
+    std::transform(conf->Speakers.get(), conf->Speakers.get()+conf->NumSpeakers,
+        std::begin(speakermap), map_spkr);
     /* Return success if no invalid entries are found. */
-    auto spkrmap_end = std::begin(speakermap) + conf->Speakers.size();
+    auto spkrmap_end = std::begin(speakermap) + conf->NumSpeakers;
     return std::find(std::begin(speakermap), spkrmap_end, INVALID_CHANNEL_INDEX) == spkrmap_end;
 }
 
 
-void InitNearFieldCtrl(ALCdevice *device, float ctrl_dist, ALuint order, bool is3d)
+void InitNearFieldCtrl(ALCdevice *device, float ctrl_dist, uint order, bool is3d)
 {
-    static const ALuint chans_per_order2d[MAX_AMBI_ORDER+1]{ 1, 2, 2, 2 };
-    static const ALuint chans_per_order3d[MAX_AMBI_ORDER+1]{ 1, 3, 5, 7 };
+    static const uint chans_per_order2d[MaxAmbiOrder+1]{ 1, 2, 2, 2 };
+    static const uint chans_per_order3d[MaxAmbiOrder+1]{ 1, 3, 5, 7 };
 
     /* NFC is only used when AvgSpeakerDist is greater than 0. */
     const char *devname{device->DeviceName.c_str()};
@@ -245,24 +235,25 @@ void InitNearFieldCtrl(ALCdevice *device, float ctrl_dist, ALuint order, bool is
 }
 
 void InitDistanceComp(ALCdevice *device, const AmbDecConf *conf,
-    const ALuint (&speakermap)[MAX_OUTPUT_CHANNELS])
+    const uint (&speakermap)[MAX_OUTPUT_CHANNELS])
 {
     auto get_max = std::bind(maxf, _1,
         std::bind(std::mem_fn(&AmbDecConf::SpeakerConf::Distance), _2));
-    const float maxdist{std::accumulate(conf->Speakers.begin(), conf->Speakers.end(), 0.0f,
-        get_max)};
+    const float maxdist{std::accumulate(conf->Speakers.get(),
+        conf->Speakers.get()+conf->NumSpeakers, 0.0f, get_max)};
 
     const char *devname{device->DeviceName.c_str()};
     if(!GetConfigValueBool(devname, "decoder", "distance-comp", 1) || !(maxdist > 0.0f))
         return;
 
     const auto distSampleScale = static_cast<float>(device->Frequency) / SpeedOfSoundMetersPerSec;
-    const auto ChanDelay = device->ChannelDelay.as_span();
+    std::vector<DistanceComp::ChanData> ChanDelay;
     size_t total{0u};
-    for(size_t i{0u};i < conf->Speakers.size();i++)
+    ChanDelay.reserve(conf->NumSpeakers + 1);
+    for(size_t i{0u};i < conf->NumSpeakers;i++)
     {
         const AmbDecConf::SpeakerConf &speaker = conf->Speakers[i];
-        const ALuint chan{speakermap[i]};
+        const uint chan{speakermap[i]};
 
         /* Distance compensation only delays in steps of the sample rate. This
          * is a bit less accurate since the delay time falls to the nearest
@@ -278,7 +269,8 @@ void InitDistanceComp(ALCdevice *device, const AmbDecConf *conf,
             delay = float{MAX_DELAY_LENGTH-1};
         }
 
-        ChanDelay[chan].Length = static_cast<ALuint>(delay);
+        ChanDelay.resize(maxz(ChanDelay.size(), chan+1));
+        ChanDelay[chan].Length = static_cast<uint>(delay);
         ChanDelay[chan].Gain = speaker.Distance / maxdist;
         TRACE("Channel %u \"%s\" distance compensation: %u samples, %f gain\n", chan,
             speaker.Name.c_str(), ChanDelay[chan].Length, ChanDelay[chan].Gain);
@@ -291,34 +283,38 @@ void InitDistanceComp(ALCdevice *device, const AmbDecConf *conf,
 
     if(total > 0)
     {
-        device->ChannelDelay.setSampleCount(total);
-        ChanDelay[0].Buffer = device->ChannelDelay.getSamples();
-        auto set_bufptr = [](const DistanceComp::DistData &last, const DistanceComp::DistData &cur) -> DistanceComp::DistData
+        auto chandelays = DistanceComp::Create(total);
+        std::copy(ChanDelay.cbegin(), ChanDelay.cend(), chandelays->mChannels.begin());
+
+        chandelays->mChannels[0].Buffer = chandelays->mSamples.data();
+        auto set_bufptr = [](const DistanceComp::ChanData &last, const DistanceComp::ChanData &cur)
+            -> DistanceComp::ChanData
         {
-            DistanceComp::DistData ret{cur};
+            DistanceComp::ChanData ret{cur};
             ret.Buffer = last.Buffer + RoundUp(last.Length, 4);
             return ret;
         };
         std::partial_sum(ChanDelay.begin(), ChanDelay.end(), ChanDelay.begin(), set_bufptr);
+        device->ChannelDelays = std::move(chandelays);
     }
 }
 
 
-auto GetAmbiScales(DevAmbiScaling scaletype) noexcept -> const std::array<float,MAX_AMBI_CHANNELS>&
+inline auto& GetAmbiScales(DevAmbiScaling scaletype) noexcept
 {
-    if(scaletype == DevAmbiScaling::FuMa) return AmbiScale::FromFuMa;
-    if(scaletype == DevAmbiScaling::SN3D) return AmbiScale::FromSN3D;
-    return AmbiScale::FromN3D;
+    if(scaletype == DevAmbiScaling::FuMa) return AmbiScale::FromFuMa();
+    if(scaletype == DevAmbiScaling::SN3D) return AmbiScale::FromSN3D();
+    return AmbiScale::FromN3D();
 }
 
-auto GetAmbiLayout(DevAmbiLayout layouttype) noexcept -> const std::array<uint8_t,MAX_AMBI_CHANNELS>&
+inline auto& GetAmbiLayout(DevAmbiLayout layouttype) noexcept
 {
-    if(layouttype == DevAmbiLayout::FuMa) return AmbiIndex::FromFuMa;
-    return AmbiIndex::FromACN;
+    if(layouttype == DevAmbiLayout::FuMa) return AmbiIndex::FromFuMa();
+    return AmbiIndex::FromACN();
 }
 
 
-using ChannelCoeffs = std::array<float,MAX_AMBI2D_CHANNELS>;
+using ChannelCoeffs = std::array<float,MaxAmbi2DChannels>;
 enum DecoderMode : bool {
     SingleBand = false,
     DualBand = true
@@ -329,25 +325,25 @@ struct DecoderConfig;
 
 template<size_t N>
 struct DecoderConfig<SingleBand, N> {
-    ALuint mOrder;
+    uint mOrder;
     std::array<Channel,N> mChannels;
-    std::array<float,MAX_AMBI_ORDER+1> mOrderGain;
+    std::array<float,MaxAmbiOrder+1> mOrderGain;
     std::array<ChannelCoeffs,N> mCoeffs;
 };
 
 template<size_t N>
 struct DecoderConfig<DualBand, N> {
-    ALuint mOrder;
+    uint mOrder;
     std::array<Channel,N> mChannels;
-    std::array<float,MAX_AMBI_ORDER+1> mOrderGain;
+    std::array<float,MaxAmbiOrder+1> mOrderGain;
     std::array<ChannelCoeffs,N> mCoeffs;
-    std::array<float,MAX_AMBI_ORDER+1> mOrderGainLF;
+    std::array<float,MaxAmbiOrder+1> mOrderGainLF;
     std::array<ChannelCoeffs,N> mCoeffsLF;
 };
 
 template<>
 struct DecoderConfig<DualBand, 0> {
-    ALuint mOrder;
+    uint mOrder;
     al::span<const Channel> mChannels;
     al::span<const float> mOrderGain;
     al::span<const ChannelCoeffs> mCoeffs;
@@ -496,8 +492,8 @@ void InitPanning(ALCdevice *device, const bool hqdec=false, const bool stablize=
     if(device->FmtChans == DevFmtAmbi3D)
     {
         const char *devname{device->DeviceName.c_str()};
-        const std::array<uint8_t,MAX_AMBI_CHANNELS> &acnmap = GetAmbiLayout(device->mAmbiLayout);
-        const std::array<float,MAX_AMBI_CHANNELS> &n3dscale = GetAmbiScales(device->mAmbiScale);
+        auto&& acnmap = GetAmbiLayout(device->mAmbiLayout);
+        auto&& n3dscale = GetAmbiScales(device->mAmbiScale);
 
         /* For DevFmtAmbi3D, the ambisonic order is already set. */
         const size_t count{AmbiChannelsFromOrder(device->mAmbiOrder)};
@@ -518,7 +514,7 @@ void InitPanning(ALCdevice *device, const bool hqdec=false, const bool stablize=
         al::vector<ChannelDec> chancoeffs, chancoeffslf;
         for(size_t i{0u};i < decoder.mChannels.size();++i)
         {
-            const ALuint idx{GetChannelIdxByName(device->RealOut, decoder.mChannels[i])};
+            const uint idx{GetChannelIdxByName(device->RealOut, decoder.mChannels[i])};
             if(idx == INVALID_CHANNEL_INDEX)
             {
                 ERR("Failed to find %s channel in device\n",
@@ -527,9 +523,9 @@ void InitPanning(ALCdevice *device, const bool hqdec=false, const bool stablize=
             }
 
             chancoeffs.resize(maxz(chancoeffs.size(), idx+1u), ChannelDec{});
-            al::span<float,MAX_AMBI_CHANNELS> coeffs{chancoeffs[idx]};
+            al::span<float,MaxAmbiChannels> coeffs{chancoeffs[idx]};
             size_t start{0};
-            for(ALuint o{0};o <= decoder.mOrder;++o)
+            for(uint o{0};o <= decoder.mOrder;++o)
             {
                 size_t count{o ? 2u : 1u};
                 do {
@@ -543,7 +539,7 @@ void InitPanning(ALCdevice *device, const bool hqdec=false, const bool stablize=
             chancoeffslf.resize(maxz(chancoeffslf.size(), idx+1u), ChannelDec{});
             coeffs = chancoeffslf[idx];
             start = 0;
-            for(ALuint o{0};o <= decoder.mOrder;++o)
+            for(uint o{0};o <= decoder.mOrder;++o)
             {
                 size_t count{o ? 2u : 1u};
                 do {
@@ -558,7 +554,7 @@ void InitPanning(ALCdevice *device, const bool hqdec=false, const bool stablize=
 
         /* Built-in speaker decoders are always 2D. */
         const size_t ambicount{Ambi2DChannelsFromOrder(decoder.mOrder)};
-        std::transform(AmbiIndex::From2D.begin(), AmbiIndex::From2D.begin()+ambicount,
+        std::transform(AmbiIndex::FromACN2D().begin(), AmbiIndex::FromACN2D().begin()+ambicount,
             std::begin(device->Dry.AmbiMap),
             [](const uint8_t &index) noexcept { return BFChannelConfig{1.0f, index}; }
         );
@@ -600,21 +596,22 @@ void InitPanning(ALCdevice *device, const bool hqdec=false, const bool stablize=
 }
 
 void InitCustomPanning(ALCdevice *device, const bool hqdec, const bool stablize,
-    const AmbDecConf *conf, const ALuint (&speakermap)[MAX_OUTPUT_CHANNELS])
+    const AmbDecConf *conf, const uint (&speakermap)[MAX_OUTPUT_CHANNELS])
 {
     if(!hqdec && conf->FreqBands != 1)
         ERR("Basic renderer uses the high-frequency matrix as single-band (xover_freq = %.0fhz)\n",
             conf->XOverFreq);
+    device->mXOverFreq = conf->XOverFreq;
 
-    const ALuint order{(conf->ChanMask > AMBI_2ORDER_MASK) ? 3u :
-        (conf->ChanMask > AMBI_1ORDER_MASK) ? 2u : 1u};
+    const uint order{(conf->ChanMask > Ambi2OrderMask) ? 3u :
+        (conf->ChanMask > Ambi1OrderMask) ? 2u : 1u};
     device->mAmbiOrder = order;
 
     size_t count;
-    if((conf->ChanMask&AMBI_PERIPHONIC_MASK))
+    if((conf->ChanMask&AmbiPeriphonicMask))
     {
         count = AmbiChannelsFromOrder(order);
-        std::transform(AmbiIndex::FromACN.begin(), AmbiIndex::FromACN.begin()+count,
+        std::transform(AmbiIndex::FromACN().begin(), AmbiIndex::FromACN().begin()+count,
             std::begin(device->Dry.AmbiMap),
             [](const uint8_t &index) noexcept { return BFChannelConfig{1.0f, index}; }
         );
@@ -622,7 +619,7 @@ void InitCustomPanning(ALCdevice *device, const bool hqdec, const bool stablize,
     else
     {
         count = Ambi2DChannelsFromOrder(order);
-        std::transform(AmbiIndex::From2D.begin(), AmbiIndex::From2D.begin()+count,
+        std::transform(AmbiIndex::FromACN2D().begin(), AmbiIndex::FromACN2D().begin()+count,
             std::begin(device->Dry.AmbiMap),
             [](const uint8_t &index) noexcept { return BFChannelConfig{1.0f, index}; }
         );
@@ -636,18 +633,18 @@ void InitCustomPanning(ALCdevice *device, const bool hqdec, const bool stablize,
          * front-center channel.
          */
         size_t cidx{0};
-        for(;cidx < conf->Speakers.size();++cidx)
+        for(;cidx < conf->NumSpeakers;++cidx)
         {
             if(speakermap[cidx] == FrontCenter)
                 break;
         }
         bool hasfc{false};
-        if(cidx < conf->LFMatrix.size())
+        if(cidx < conf->NumSpeakers && conf->FreqBands != 1)
         {
             for(const auto &coeff : conf->LFMatrix[cidx])
                 hasfc |= coeff != 0.0f;
         }
-        if(!hasfc && cidx < conf->HFMatrix.size())
+        if(!hasfc && cidx < conf->NumSpeakers)
         {
             for(const auto &coeff : conf->HFMatrix[cidx])
                 hasfc |= coeff != 0.0f;
@@ -661,62 +658,65 @@ void InitCustomPanning(ALCdevice *device, const bool hqdec, const bool stablize,
 
     TRACE("Enabling %s-band %s-order%s ambisonic decoder\n",
         (!hqdec || conf->FreqBands == 1) ? "single" : "dual",
-        (conf->ChanMask > AMBI_2ORDER_MASK) ? "third" :
-        (conf->ChanMask > AMBI_1ORDER_MASK) ? "second" : "first",
-        (conf->ChanMask&AMBI_PERIPHONIC_MASK) ? " periphonic" : ""
+        (conf->ChanMask > Ambi2OrderMask) ? "third" :
+        (conf->ChanMask > Ambi1OrderMask) ? "second" : "first",
+        (conf->ChanMask&AmbiPeriphonicMask) ? " periphonic" : ""
     );
     device->AmbiDecoder = BFormatDec::Create(conf, hqdec, count, device->Frequency, speakermap,
         std::move(stablizer));
 
     auto accum_spkr_dist = std::bind(std::plus<float>{}, _1,
         std::bind(std::mem_fn(&AmbDecConf::SpeakerConf::Distance), _2));
-    const float avg_dist{
-        std::accumulate(conf->Speakers.begin(), conf->Speakers.end(), 0.0f, accum_spkr_dist) /
-        static_cast<float>(conf->Speakers.size())};
-    InitNearFieldCtrl(device, avg_dist, order, !!(conf->ChanMask&AMBI_PERIPHONIC_MASK));
+    const float accum_dist{std::accumulate(conf->Speakers.get(),
+        conf->Speakers.get()+conf->NumSpeakers, 0.0f, accum_spkr_dist)};
+    InitNearFieldCtrl(device, accum_dist / static_cast<float>(conf->NumSpeakers), order,
+        !!(conf->ChanMask&AmbiPeriphonicMask));
 
     InitDistanceComp(device, conf, speakermap);
 }
 
 void InitHrtfPanning(ALCdevice *device)
 {
-    constexpr float PI{al::MathDefs<float>::Pi()};
-    constexpr float PI_2{PI / 2.0f};
-    constexpr float PI_4{PI_2 / 2.0f};
-    constexpr float PI3_4{PI_4 * 3.0f};
-    static const float CornerElev{static_cast<float>(std::atan2(1.0, std::sqrt(2.0)))};
+    constexpr float Deg180{al::MathDefs<float>::Pi()};
+    constexpr float Deg_90{Deg180 / 2.0f /* 90 degrees*/};
+    constexpr float Deg_45{Deg_90 / 2.0f /* 45 degrees*/};
+    constexpr float Deg135{Deg_45 * 3.0f /*135 degrees*/};
+    constexpr float Deg_35{6.154797086e-01f /* 35~ 36 degrees*/};
+    constexpr float Deg_69{1.205932499e+00f /* 69~ 70 degrees*/};
+    constexpr float Deg111{1.935660155e+00f /*110~111 degrees*/};
+    constexpr float Deg_21{3.648638281e-01f /* 20~ 21 degrees*/};
     static const AngularPoint AmbiPoints1O[]{
-        { EvRadians{ CornerElev}, AzRadians{ -PI_4} },
-        { EvRadians{ CornerElev}, AzRadians{-PI3_4} },
-        { EvRadians{ CornerElev}, AzRadians{  PI_4} },
-        { EvRadians{ CornerElev}, AzRadians{ PI3_4} },
-        { EvRadians{-CornerElev}, AzRadians{ -PI_4} },
-        { EvRadians{-CornerElev}, AzRadians{-PI3_4} },
-        { EvRadians{-CornerElev}, AzRadians{  PI_4} },
-        { EvRadians{-CornerElev}, AzRadians{ PI3_4} },
+        { EvRadians{ Deg_35}, AzRadians{-Deg_45} },
+        { EvRadians{ Deg_35}, AzRadians{-Deg135} },
+        { EvRadians{ Deg_35}, AzRadians{ Deg_45} },
+        { EvRadians{ Deg_35}, AzRadians{ Deg135} },
+        { EvRadians{-Deg_35}, AzRadians{-Deg_45} },
+        { EvRadians{-Deg_35}, AzRadians{-Deg135} },
+        { EvRadians{-Deg_35}, AzRadians{ Deg_45} },
+        { EvRadians{-Deg_35}, AzRadians{ Deg135} },
     }, AmbiPoints2O[]{
-        { EvRadians{      -CornerElev}, AzRadians{            -PI_4} },
-        { EvRadians{      -CornerElev}, AzRadians{           -PI3_4} },
-        { EvRadians{       CornerElev}, AzRadians{           -PI3_4} },
-        { EvRadians{       CornerElev}, AzRadians{            PI3_4} },
-        { EvRadians{       CornerElev}, AzRadians{             PI_4} },
-        { EvRadians{      -CornerElev}, AzRadians{             PI_4} },
-        { EvRadians{      -CornerElev}, AzRadians{            PI3_4} },
-        { EvRadians{       CornerElev}, AzRadians{            -PI_4} },
-        { EvRadians{-1.205932499e+00f}, AzRadians{            -PI_2} },
-        { EvRadians{ 1.205932499e+00f}, AzRadians{             PI_2} },
-        { EvRadians{-1.205932499e+00f}, AzRadians{             PI_2} },
-        { EvRadians{ 1.205932499e+00f}, AzRadians{            -PI_2} },
-        { EvRadians{             0.0f}, AzRadians{-1.205932499e+00f} },
-        { EvRadians{             0.0f}, AzRadians{-1.935660155e+00f} },
-        { EvRadians{             0.0f}, AzRadians{ 1.205932499e+00f} },
-        { EvRadians{             0.0f}, AzRadians{ 1.935660155e+00f} },
-        { EvRadians{-3.648638281e-01f}, AzRadians{               PI} },
-        { EvRadians{ 3.648638281e-01f}, AzRadians{               PI} },
-        { EvRadians{ 3.648638281e-01f}, AzRadians{             0.0f} },
-        { EvRadians{-3.648638281e-01f}, AzRadians{             0.0f} },
+        { EvRadians{-Deg_35}, AzRadians{-Deg_45} },
+        { EvRadians{-Deg_35}, AzRadians{-Deg135} },
+        { EvRadians{ Deg_35}, AzRadians{-Deg135} },
+        { EvRadians{ Deg_35}, AzRadians{ Deg135} },
+        { EvRadians{ Deg_35}, AzRadians{ Deg_45} },
+        { EvRadians{-Deg_35}, AzRadians{ Deg_45} },
+        { EvRadians{-Deg_35}, AzRadians{ Deg135} },
+        { EvRadians{ Deg_35}, AzRadians{-Deg_45} },
+        { EvRadians{-Deg_69}, AzRadians{-Deg_90} },
+        { EvRadians{ Deg_69}, AzRadians{ Deg_90} },
+        { EvRadians{-Deg_69}, AzRadians{ Deg_90} },
+        { EvRadians{ Deg_69}, AzRadians{-Deg_90} },
+        { EvRadians{   0.0f}, AzRadians{-Deg_69} },
+        { EvRadians{   0.0f}, AzRadians{-Deg111} },
+        { EvRadians{   0.0f}, AzRadians{ Deg_69} },
+        { EvRadians{   0.0f}, AzRadians{ Deg111} },
+        { EvRadians{-Deg_21}, AzRadians{ Deg180} },
+        { EvRadians{ Deg_21}, AzRadians{ Deg180} },
+        { EvRadians{ Deg_21}, AzRadians{   0.0f} },
+        { EvRadians{-Deg_21}, AzRadians{   0.0f} },
     };
-    static const float AmbiMatrix1O[][MAX_AMBI_CHANNELS]{
+    static const float AmbiMatrix1O[][MaxAmbiChannels]{
         { 1.250000000e-01f,  1.250000000e-01f,  1.250000000e-01f,  1.250000000e-01f },
         { 1.250000000e-01f,  1.250000000e-01f,  1.250000000e-01f, -1.250000000e-01f },
         { 1.250000000e-01f, -1.250000000e-01f,  1.250000000e-01f,  1.250000000e-01f },
@@ -725,7 +725,7 @@ void InitHrtfPanning(ALCdevice *device)
         { 1.250000000e-01f,  1.250000000e-01f, -1.250000000e-01f, -1.250000000e-01f },
         { 1.250000000e-01f, -1.250000000e-01f, -1.250000000e-01f,  1.250000000e-01f },
         { 1.250000000e-01f, -1.250000000e-01f, -1.250000000e-01f, -1.250000000e-01f },
-    }, AmbiMatrix2O[][MAX_AMBI_CHANNELS]{
+    }, AmbiMatrix2O[][MaxAmbiChannels]{
         { 5.000000000e-02f,  5.000000000e-02f, -5.000000000e-02f,  5.000000000e-02f,  6.454972244e-02f, -6.454972244e-02f,  0.000000000e+00f, -6.454972244e-02f,  0.000000000e+00f },
         { 5.000000000e-02f,  5.000000000e-02f, -5.000000000e-02f, -5.000000000e-02f, -6.454972244e-02f, -6.454972244e-02f,  0.000000000e+00f,  6.454972244e-02f,  0.000000000e+00f },
         { 5.000000000e-02f,  5.000000000e-02f,  5.000000000e-02f, -5.000000000e-02f, -6.454972244e-02f,  6.454972244e-02f,  0.000000000e+00f, -6.454972244e-02f,  0.000000000e+00f },
@@ -747,9 +747,9 @@ void InitHrtfPanning(ALCdevice *device)
         { 5.000000000e-02f,  0.000000000e+00f,  3.090169944e-02f,  8.090169944e-02f,  0.000000000e+00f,  0.000000000e+00f, -3.454915028e-02f,  6.454972244e-02f,  8.449668365e-02f },
         { 5.000000000e-02f,  0.000000000e+00f, -3.090169944e-02f,  8.090169944e-02f,  0.000000000e+00f,  0.000000000e+00f, -3.454915028e-02f, -6.454972244e-02f,  8.449668365e-02f },
     };
-    static const float AmbiOrderHFGain1O[MAX_AMBI_ORDER+1]{
+    static const float AmbiOrderHFGain1O[MaxAmbiOrder+1]{
         2.000000000e+00f, 1.154700538e+00f
-    }, AmbiOrderHFGain2O[MAX_AMBI_ORDER+1]{
+    }, AmbiOrderHFGain2O[MaxAmbiOrder+1]{
         2.357022604e+00f, 1.825741858e+00f, 9.428090416e-01f
     };
 
@@ -760,13 +760,13 @@ void InitHrtfPanning(ALCdevice *device)
      * and it eases the CPU/memory load.
      */
     device->mRenderMode = RenderMode::Hrtf;
-    ALuint ambi_order{1};
+    uint ambi_order{1};
     if(auto modeopt = ConfigValueStr(device->DeviceName.c_str(), nullptr, "hrtf-mode"))
     {
         struct HrtfModeEntry {
             char name[8];
             RenderMode mode;
-            ALuint order;
+            uint order;
         };
         static const HrtfModeEntry hrtf_modes[]{
             { "full", RenderMode::Hrtf, 1 },
@@ -801,8 +801,8 @@ void InitHrtfPanning(ALCdevice *device)
         device->HrtfName.c_str());
 
     al::span<const AngularPoint> AmbiPoints{AmbiPoints1O};
-    const float (*AmbiMatrix)[MAX_AMBI_CHANNELS]{AmbiMatrix1O};
-    al::span<const float,MAX_AMBI_ORDER+1> AmbiOrderHFGain{AmbiOrderHFGain1O};
+    const float (*AmbiMatrix)[MaxAmbiChannels]{AmbiMatrix1O};
+    al::span<const float,MaxAmbiOrder+1> AmbiOrderHFGain{AmbiOrderHFGain1O};
     if(ambi_order >= 2)
     {
         AmbiPoints = AmbiPoints2O;
@@ -812,7 +812,7 @@ void InitHrtfPanning(ALCdevice *device)
     device->mAmbiOrder = ambi_order;
 
     const size_t count{AmbiChannelsFromOrder(ambi_order)};
-    std::transform(AmbiIndex::FromACN.begin(), AmbiIndex::FromACN.begin()+count,
+    std::transform(AmbiIndex::FromACN().begin(), AmbiIndex::FromACN().begin()+count,
         std::begin(device->Dry.AmbiMap),
         [](const uint8_t &index) noexcept { return BFChannelConfig{1.0f, index}; }
     );
@@ -820,7 +820,8 @@ void InitHrtfPanning(ALCdevice *device)
 
     HrtfStore *Hrtf{device->mHrtf.get()};
     auto hrtfstate = DirectHrtfState::Create(count);
-    hrtfstate->build(Hrtf, AmbiPoints, AmbiMatrix, AmbiOrderHFGain);
+    hrtfstate->build(Hrtf, device->mIrSize, AmbiPoints, AmbiMatrix, device->mXOverFreq,
+        AmbiOrderHFGain);
     device->mHrtfState = std::move(hrtfstate);
 
     InitNearFieldCtrl(device, Hrtf->field[0].distance, ambi_order, true);
@@ -833,11 +834,10 @@ void InitUhjPanning(ALCdevice *device)
 
     device->mAmbiOrder = 1;
 
-    auto acnmap_end = AmbiIndex::FromFuMa.begin() + count;
-    std::transform(AmbiIndex::FromFuMa.begin(), acnmap_end, std::begin(device->Dry.AmbiMap),
+    auto acnmap_begin = AmbiIndex::FromFuMa().begin();
+    std::transform(acnmap_begin, acnmap_begin + count, std::begin(device->Dry.AmbiMap),
         [](const uint8_t &acn) noexcept -> BFChannelConfig
-        { return BFChannelConfig{1.0f/AmbiScale::FromFuMa[acn], acn}; }
-    );
+        { return BFChannelConfig{1.0f/AmbiScale::FromFuMa()[acn], acn}; });
     AllocChannels(device, count, device->channelsFromFmt());
 }
 
@@ -846,12 +846,16 @@ void InitUhjPanning(ALCdevice *device)
 void aluInitRenderer(ALCdevice *device, int hrtf_id, HrtfRequestMode hrtf_appreq,
     HrtfRequestMode hrtf_userreq)
 {
+    const char *devname{device->DeviceName.c_str()};
+
     /* Hold the HRTF the device last used, in case it's used again. */
     HrtfStorePtr old_hrtf{std::move(device->mHrtf)};
 
     device->mHrtfState = nullptr;
     device->mHrtf = nullptr;
+    device->mIrSize = 0;
     device->HrtfName.clear();
+    device->mXOverFreq = 400.0f;
     device->mRenderMode = RenderMode::Normal;
 
     if(device->FmtChans != DevFmtStereo)
@@ -875,22 +879,24 @@ void aluInitRenderer(ALCdevice *device, int hrtf_id, HrtfRequestMode hrtf_appreq
                 break;
         }
 
-        const char *devname{device->DeviceName.c_str()};
-        ALuint speakermap[MAX_OUTPUT_CHANNELS];
+        uint speakermap[MAX_OUTPUT_CHANNELS];
         AmbDecConf *pconf{nullptr};
         AmbDecConf conf{};
         if(layout)
         {
             if(auto decopt = ConfigValueStr(devname, "decoder", layout))
             {
-                if(!conf.load(decopt->c_str()))
+                if(auto err = conf.load(decopt->c_str()))
+                {
                     ERR("Failed to load layout file %s\n", decopt->c_str());
-                else if(conf.Speakers.size() > MAX_OUTPUT_CHANNELS)
-                    ERR("Unsupported speaker count %zu (max %d)\n", conf.Speakers.size(),
+                    ERR("  %s\n", err->c_str());
+                }
+                else if(conf.NumSpeakers > MAX_OUTPUT_CHANNELS)
+                    ERR("Unsupported decoder speaker count %zu (max %d)\n", conf.NumSpeakers,
                         MAX_OUTPUT_CHANNELS);
-                else if(conf.ChanMask > AMBI_3ORDER_MASK)
-                    ERR("Unsupported channel mask 0x%04x (max 0x%x)\n", conf.ChanMask,
-                        AMBI_3ORDER_MASK);
+                else if(conf.ChanMask > Ambi3OrderMask)
+                    ERR("Unsupported decoder channel mask 0x%04x (max 0x%x)\n", conf.ChanMask,
+                        Ambi3OrderMask);
                 else if(MakeSpeakerMap(device, &conf, speakermap))
                     pconf = &conf;
             }
@@ -955,11 +961,10 @@ void aluInitRenderer(ALCdevice *device, int hrtf_id, HrtfRequestMode hrtf_appreq
     if(device->HrtfList.empty())
         device->HrtfList = EnumerateHrtf(device->DeviceName.c_str());
 
-    if(hrtf_id >= 0 && static_cast<ALuint>(hrtf_id) < device->HrtfList.size())
+    if(hrtf_id >= 0 && static_cast<uint>(hrtf_id) < device->HrtfList.size())
     {
-        const char *devname{device->DeviceName.c_str()};
-        const std::string &hrtfname = device->HrtfList[static_cast<ALuint>(hrtf_id)];
-        if(HrtfStorePtr hrtf{GetLoadedHrtf(hrtfname, devname, device->Frequency)})
+        const std::string &hrtfname = device->HrtfList[static_cast<uint>(hrtf_id)];
+        if(HrtfStorePtr hrtf{GetLoadedHrtf(hrtfname, device->Frequency)})
         {
             device->mHrtf = std::move(hrtf);
             device->HrtfName = hrtfname;
@@ -968,21 +973,28 @@ void aluInitRenderer(ALCdevice *device, int hrtf_id, HrtfRequestMode hrtf_appreq
 
     if(!device->mHrtf)
     {
-        const char *devname{device->DeviceName.c_str()};
-        auto find_hrtf = [device,devname](const std::string &hrtfname) -> bool
+        for(const auto &hrtfname : device->HrtfList)
         {
-            HrtfStorePtr hrtf{GetLoadedHrtf(hrtfname, devname, device->Frequency)};
-            if(!hrtf) return false;
-            device->mHrtf = std::move(hrtf);
-            device->HrtfName = hrtfname;
-            return true;
-        };
-        (void)std::find_if(device->HrtfList.cbegin(), device->HrtfList.cend(), find_hrtf);
+            if(HrtfStorePtr hrtf{GetLoadedHrtf(hrtfname, device->Frequency)})
+            {
+                device->mHrtf = std::move(hrtf);
+                device->HrtfName = hrtfname;
+                break;
+            }
+        }
     }
 
     if(device->mHrtf)
     {
         old_hrtf = nullptr;
+
+        HrtfStore *hrtf{device->mHrtf.get()};
+        device->mIrSize = hrtf->irSize;
+        if(auto hrtfsizeopt = ConfigValueUInt(devname, nullptr, "hrtf-size"))
+        {
+            if(*hrtfsizeopt > 0 && *hrtfsizeopt < device->mIrSize)
+                device->mIrSize = maxu(*hrtfsizeopt, MinIrLength);
+        }
 
         InitHrtfPanning(device);
         device->PostProcess = &ALCdevice::ProcessHrtf;
@@ -1035,7 +1047,7 @@ no_hrtf:
 }
 
 
-void aluInitEffectPanning(ALeffectslot *slot, ALCcontext *context)
+void aluInitEffectPanning(EffectSlot *slot, ALCcontext *context)
 {
     ALCdevice *device{context->mDevice.get()};
     const size_t count{AmbiChannelsFromOrder(device->mAmbiOrder)};
@@ -1079,8 +1091,8 @@ void aluInitEffectPanning(ALeffectslot *slot, ALCcontext *context)
     WetBuffer *wetbuffer{slot->mWetBuffer = wetbuffer_iter->get()};
     wetbuffer->mInUse = true;
 
-    auto acnmap_end = AmbiIndex::FromACN.begin() + count;
-    auto iter = std::transform(AmbiIndex::FromACN.begin(), acnmap_end, slot->Wet.AmbiMap.begin(),
+    auto acnmap_begin = AmbiIndex::FromACN().begin();
+    auto iter = std::transform(acnmap_begin, acnmap_begin + count, slot->Wet.AmbiMap.begin(),
         [](const uint8_t &acn) noexcept -> BFChannelConfig
         { return BFChannelConfig{1.0f, acn}; });
     std::fill(iter, slot->Wet.AmbiMap.end(), BFChannelConfig{});
@@ -1088,10 +1100,10 @@ void aluInitEffectPanning(ALeffectslot *slot, ALCcontext *context)
 }
 
 
-std::array<float,MAX_AMBI_CHANNELS> CalcAmbiCoeffs(const float y, const float z, const float x,
+std::array<float,MaxAmbiChannels> CalcAmbiCoeffs(const float y, const float z, const float x,
     const float spread)
 {
-    std::array<float,MAX_AMBI_CHANNELS> coeffs;
+    std::array<float,MaxAmbiChannels> coeffs;
 
     /* Zeroth-order */
     coeffs[0]  = 1.0f; /* ACN 0 = 1 */
@@ -1100,20 +1112,20 @@ std::array<float,MAX_AMBI_CHANNELS> CalcAmbiCoeffs(const float y, const float z,
     coeffs[2]  = 1.732050808f * z; /* ACN 2 = sqrt(3) * Z */
     coeffs[3]  = 1.732050808f * x; /* ACN 3 = sqrt(3) * X */
     /* Second-order */
-    const float xx{x*x}, yy{y*y}, zz{z*z};
-    coeffs[4]  = 3.872983346f * x * y;            /* ACN 4 = sqrt(15) * X * Y */
-    coeffs[5]  = 3.872983346f * y * z;            /* ACN 5 = sqrt(15) * Y * Z */
+    const float xx{x*x}, yy{y*y}, zz{z*z}, xy{x*y}, yz{y*z}, xz{x*z};
+    coeffs[4]  = 3.872983346f * xy;               /* ACN 4 = sqrt(15) * X * Y */
+    coeffs[5]  = 3.872983346f * yz;               /* ACN 5 = sqrt(15) * Y * Z */
     coeffs[6]  = 1.118033989f * (3.0f*zz - 1.0f); /* ACN 6 = sqrt(5)/2 * (3*Z*Z - 1) */
-    coeffs[7]  = 3.872983346f * x * z;            /* ACN 7 = sqrt(15) * X * Z */
+    coeffs[7]  = 3.872983346f * xz;               /* ACN 7 = sqrt(15) * X * Z */
     coeffs[8]  = 1.936491673f * (xx - yy);        /* ACN 8 = sqrt(15)/2 * (X*X - Y*Y) */
     /* Third-order */
-    coeffs[9]  =  2.091650066f * y * (3.0f*xx - yy);   /* ACN  9 = sqrt(35/8) * Y * (3*X*X - Y*Y) */
-    coeffs[10] = 10.246950766f * z * x * y;            /* ACN 10 = sqrt(105) * Z * X * Y */
-    coeffs[11] =  1.620185175f * y * (5.0f*zz - 1.0f); /* ACN 11 = sqrt(21/8) * Y * (5*Z*Z - 1) */
-    coeffs[12] =  1.322875656f * z * (5.0f*zz - 3.0f); /* ACN 12 = sqrt(7)/2 * Z * (5*Z*Z - 3) */
-    coeffs[13] =  1.620185175f * x * (5.0f*zz - 1.0f); /* ACN 13 = sqrt(21/8) * X * (5*Z*Z - 1) */
-    coeffs[14] =  5.123475383f * z * (xx - yy);        /* ACN 14 = sqrt(105)/2 * Z * (X*X - Y*Y) */
-    coeffs[15] =  2.091650066f * x * (xx - 3.0f*yy);   /* ACN 15 = sqrt(35/8) * X * (X*X - 3*Y*Y) */
+    coeffs[9]  =  2.091650066f * (y*(3.0f*xx - yy));   /* ACN  9 = sqrt(35/8) * Y * (3*X*X - Y*Y) */
+    coeffs[10] = 10.246950766f * (z*xy);               /* ACN 10 = sqrt(105) * Z * X * Y */
+    coeffs[11] =  1.620185175f * (y*(5.0f*zz - 1.0f)); /* ACN 11 = sqrt(21/8) * Y * (5*Z*Z - 1) */
+    coeffs[12] =  1.322875656f * (z*(5.0f*zz - 3.0f)); /* ACN 12 = sqrt(7)/2 * Z * (5*Z*Z - 3) */
+    coeffs[13] =  1.620185175f * (x*(5.0f*zz - 1.0f)); /* ACN 13 = sqrt(21/8) * X * (5*Z*Z - 1) */
+    coeffs[14] =  5.123475383f * (z*(xx - yy));        /* ACN 14 = sqrt(105)/2 * Z * (X*X - Y*Y) */
+    coeffs[15] =  2.091650066f * (x*(xx - 3.0f*yy));   /* ACN 15 = sqrt(35/8) * X * (X*X - 3*Y*Y) */
     /* Fourth-order */
     /* ACN 16 = sqrt(35)*3/2 * X * Y * (X*X - Y*Y) */
     /* ACN 17 = sqrt(35/2)*3/2 * (3*X*X - Y*Y) * Y * Z */

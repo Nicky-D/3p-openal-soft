@@ -1,6 +1,7 @@
 #ifndef ALCONTEXT_H
 #define ALCONTEXT_H
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -20,23 +21,24 @@
 #include "inprogext.h"
 #include "intrusive_ptr.h"
 #include "threads.h"
+#include "vecmat.h"
 #include "vector.h"
-#include "voice.h"
 
 struct ALeffectslot;
-struct ALeffectslotProps;
 struct ALsource;
+struct EffectSlot;
+struct EffectSlotProps;
 struct RingBuffer;
+struct Voice;
+struct VoiceChange;
+struct VoicePropsItem;
 
 
-enum class DistanceModel {
-    InverseClamped  = AL_INVERSE_DISTANCE_CLAMPED,
-    LinearClamped   = AL_LINEAR_DISTANCE_CLAMPED,
-    ExponentClamped = AL_EXPONENT_DISTANCE_CLAMPED,
-    Inverse  = AL_INVERSE_DISTANCE,
-    Linear   = AL_LINEAR_DISTANCE,
-    Exponent = AL_EXPONENT_DISTANCE,
-    Disable  = AL_NONE,
+enum class DistanceModel : unsigned char {
+    Disable,
+    Inverse, InverseClamped,
+    Linear, LinearClamped,
+    Exponent, ExponentClamped,
 
     Default = InverseClamped
 };
@@ -53,28 +55,47 @@ struct WetBuffer {
 using WetBufferPtr = std::unique_ptr<WetBuffer>;
 
 
-struct ALcontextProps {
+struct ContextProps {
     float DopplerFactor;
     float DopplerVelocity;
     float SpeedOfSound;
     bool SourceDistanceModel;
     DistanceModel mDistanceModel;
 
-    std::atomic<ALcontextProps*> next;
+    std::atomic<ContextProps*> next;
 
-    DEF_NEWDEL(ALcontextProps)
+    DEF_NEWDEL(ContextProps)
 };
 
+struct ListenerProps {
+    std::array<float,3> Position;
+    std::array<float,3> Velocity;
+    std::array<float,3> OrientAt;
+    std::array<float,3> OrientUp;
+    float Gain;
+    float MetersPerUnit;
 
-struct VoiceChange {
-    Voice *mOldVoice{nullptr};
-    Voice *mVoice{nullptr};
-    ALuint mSourceID{0};
-    ALenum mState{0};
+    std::atomic<ListenerProps*> next;
 
-    std::atomic<VoiceChange*> mNext{nullptr};
+    DEF_NEWDEL(ListenerProps)
+};
 
-    DEF_NEWDEL(VoiceChange)
+struct ContextParams {
+    /* Pointer to the most recent property values that are awaiting an update. */
+    std::atomic<ContextProps*> ContextUpdate{nullptr};
+    std::atomic<ListenerProps*> ListenerUpdate{nullptr};
+
+    alu::Matrix Matrix{alu::Matrix::Identity()};
+    alu::Vector Velocity{};
+
+    float Gain{1.0f};
+    float MetersPerUnit{1.0f};
+
+    float DopplerFactor{1.0f};
+    float SpeedOfSound{343.3f}; /* in units per sec! */
+
+    bool SourceDistanceModel{false};
+    DistanceModel mDistanceModel{};
 };
 
 
@@ -110,27 +131,7 @@ struct EffectSlotSubList {
 };
 
 struct ALCcontext : public al::intrusive_ref<ALCcontext> {
-    al::vector<SourceSubList> mSourceList;
-    ALuint mNumSources{0};
-    std::mutex mSourceLock;
-
-    al::vector<EffectSlotSubList> mEffectSlotList;
-    ALuint mNumEffectSlots{0u};
-    std::mutex mEffectSlotLock;
-
-    std::atomic<ALenum> mLastError{AL_NO_ERROR};
-
-    DistanceModel mDistanceModel{DistanceModel::Default};
-    bool mSourceDistanceModel{false};
-
-    float mDopplerFactor{1.0f};
-    float mDopplerVelocity{1.0f};
-    float mSpeedOfSound{SpeedOfSoundMetersPerSec};
-
-    std::atomic_flag mPropsClean;
-    std::atomic<bool> mDeferUpdates{false};
-
-    std::mutex mPropLock;
+    const al::intrusive_ptr<ALCdevice> mDevice;
 
     /* Counter for the pre-mixing updates, in 31.1 fixed point (lowest bit
      * indicates if updates are currently happening).
@@ -140,23 +141,13 @@ struct ALCcontext : public al::intrusive_ref<ALCcontext> {
 
     float mGainBoost{1.0f};
 
-    std::atomic<ALcontextProps*> mUpdate{nullptr};
-
     /* Linked lists of unused property containers, free to use for future
      * updates.
      */
-    std::atomic<ALcontextProps*> mFreeContextProps{nullptr};
-    std::atomic<ALlistenerProps*> mFreeListenerProps{nullptr};
+    std::atomic<ContextProps*> mFreeContextProps{nullptr};
+    std::atomic<ListenerProps*> mFreeListenerProps{nullptr};
     std::atomic<VoicePropsItem*> mFreeVoiceProps{nullptr};
-    std::atomic<ALeffectslotProps*> mFreeEffectslotProps{nullptr};
-
-    /* Asynchronous voice change actions are processed as a linked list of
-     * VoiceChange objects by the mixer, which is atomically appended to.
-     * However, to avoid allocating each object individually, they're allocated
-     * in clusters that are stored in a vector for easy automatic cleanup.
-     */
-    using VoiceChangeCluster = std::unique_ptr<VoiceChange[]>;
-    al::vector<VoiceChangeCluster> mVoiceChangeClusters;
+    std::atomic<EffectSlotProps*> mFreeEffectslotProps{nullptr};
 
     /* The voice change tail is the beginning of the "free" elements, up to and
      * *excluding* the current. If tail==current, there's no free elements and
@@ -169,8 +160,7 @@ struct ALCcontext : public al::intrusive_ref<ALCcontext> {
     void allocVoiceChanges(size_t addcount);
 
 
-    using VoiceCluster = std::unique_ptr<Voice[]>;
-    al::vector<VoiceCluster> mVoiceClusters;
+    ContextParams mParams;
 
     using VoiceArray = al::FlexArray<Voice*>;
     std::atomic<VoiceArray*> mVoices{};
@@ -189,27 +179,61 @@ struct ALCcontext : public al::intrusive_ref<ALCcontext> {
     }
 
 
-    /* Wet buffers used by effect slots. */
-    al::vector<WetBufferPtr> mWetBuffers;
-
-    using ALeffectslotArray = al::FlexArray<ALeffectslot*>;
-    std::atomic<ALeffectslotArray*> mActiveAuxSlots{nullptr};
+    using EffectSlotArray = al::FlexArray<EffectSlot*>;
+    std::atomic<EffectSlotArray*> mActiveAuxSlots{nullptr};
 
     std::thread mEventThread;
     al::semaphore mEventSem;
     std::unique_ptr<RingBuffer> mAsyncEvents;
-    std::atomic<ALbitfieldSOFT> mEnabledEvts{0u};
+    std::atomic<uint> mEnabledEvts{0u};
+
+    /* Asynchronous voice change actions are processed as a linked list of
+     * VoiceChange objects by the mixer, which is atomically appended to.
+     * However, to avoid allocating each object individually, they're allocated
+     * in clusters that are stored in a vector for easy automatic cleanup.
+     */
+    using VoiceChangeCluster = std::unique_ptr<VoiceChange[]>;
+    al::vector<VoiceChangeCluster> mVoiceChangeClusters;
+
+    using VoiceCluster = std::unique_ptr<Voice[]>;
+    al::vector<VoiceCluster> mVoiceClusters;
+
+    /* Wet buffers used by effect slots. */
+    al::vector<WetBufferPtr> mWetBuffers;
+
+
+    std::atomic_flag mPropsClean;
+    std::atomic<bool> mDeferUpdates{false};
+
+    std::mutex mPropLock;
+
+    std::atomic<ALenum> mLastError{AL_NO_ERROR};
+
+    DistanceModel mDistanceModel{DistanceModel::Default};
+    bool mSourceDistanceModel{false};
+
+    float mDopplerFactor{1.0f};
+    float mDopplerVelocity{1.0f};
+    float mSpeedOfSound{SpeedOfSoundMetersPerSec};
+
     std::mutex mEventCbLock;
     ALEVENTPROCSOFT mEventCb{};
     void *mEventParam{nullptr};
 
+    ALlistener mListener{};
+
+    al::vector<SourceSubList> mSourceList;
+    ALuint mNumSources{0};
+    std::mutex mSourceLock;
+
+    al::vector<EffectSlotSubList> mEffectSlotList;
+    ALuint mNumEffectSlots{0u};
+    std::mutex mEffectSlotLock;
+
     /* Default effect slot */
     std::unique_ptr<ALeffectslot> mDefaultSlot;
 
-    const al::intrusive_ptr<ALCdevice> mDevice;
     const char *mExtensionList{nullptr};
-
-    ALlistener mListener{};
 
 
     ALCcontext(al::intrusive_ptr<ALCdevice> device);

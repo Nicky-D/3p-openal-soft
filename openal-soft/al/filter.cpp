@@ -36,11 +36,12 @@
 #include "AL/alc.h"
 #include "AL/efx.h"
 
+#include "albit.h"
 #include "alcmain.h"
 #include "alcontext.h"
-#include "alexcpt.h"
 #include "almalloc.h"
 #include "alnumeric.h"
+#include "core/except.h"
 #include "opthelpers.h"
 #include "vector.h"
 
@@ -48,15 +49,18 @@
 namespace {
 
 class filter_exception final : public al::base_exception {
+    ALenum mErrorCode;
+
 public:
     [[gnu::format(printf, 3, 4)]]
-    filter_exception(ALenum code, const char *msg, ...) : base_exception{code}
+    filter_exception(ALenum code, const char *msg, ...) : mErrorCode{code}
     {
         std::va_list args;
         va_start(args, msg);
         setMessage(msg, args);
         va_end(args);
     }
+    ALenum errorCode() const noexcept { return mErrorCode; }
 };
 
 #define FILTER_MIN_GAIN 0.0f
@@ -321,7 +325,7 @@ bool EnsureFilters(ALCdevice *device, size_t needed)
 {
     size_t count{std::accumulate(device->FilterList.cbegin(), device->FilterList.cend(), size_t{0},
         [](size_t cur, const FilterSubList &sublist) noexcept -> size_t
-        { return cur + static_cast<ALuint>(PopCount(sublist.FreeMask)); })};
+        { return cur + static_cast<ALuint>(al::popcount(sublist.FreeMask)); })};
 
     while(needed > count)
     {
@@ -350,7 +354,7 @@ ALfilter *AllocFilter(ALCdevice *device)
         { return entry.FreeMask != 0; }
     );
     auto lidx = static_cast<ALuint>(std::distance(device->FilterList.begin(), sublist));
-    auto slidx = static_cast<ALuint>(CountTrailingZeros(sublist->FreeMask));
+    auto slidx = static_cast<ALuint>(al::countr_zero(sublist->FreeMask));
 
     ALfilter *filter{::new(sublist->Filters + slidx) ALfilter{}};
     InitFilterParams(filter, AL_FILTER_NULL);
@@ -701,7 +705,7 @@ FilterSubList::~FilterSubList()
     uint64_t usemask{~FreeMask};
     while(usemask)
     {
-        const ALsizei idx{CountTrailingZeros(usemask)};
+        const int idx{al::countr_zero(usemask)};
         al::destroy_at(Filters+idx);
         usemask &= ~(1_u64 << idx);
     }
