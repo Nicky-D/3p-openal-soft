@@ -34,9 +34,8 @@
 #include "alcmain.h"
 #include "alu.h"
 #include "alconfig.h"
-#include "alexcpt.h"
+#include "core/logging.h"
 #include "dynload.h"
-#include "logging.h"
 #include "ringbuffer.h"
 #include "threads.h"
 
@@ -46,7 +45,7 @@
 
 namespace {
 
-constexpr ALCchar jackDevice[] = "JACK Default";
+constexpr char jackDevice[] = "JACK Default";
 
 
 #ifdef HAVE_DYNLOAD
@@ -73,7 +72,7 @@ constexpr ALCchar jackDevice[] = "JACK Default";
 
 void *jack_handle;
 #define MAKE_FUNC(f) decltype(f) * p##f
-JACK_FUNCS(MAKE_FUNC);
+JACK_FUNCS(MAKE_FUNC)
 decltype(jack_error_callback) * pjack_error_callback;
 #undef MAKE_FUNC
 
@@ -214,7 +213,7 @@ struct JackPlayback final : public BackendBase {
 
     int mixerProc();
 
-    void open(const ALCchar *name) override;
+    void open(const char *name) override;
     bool reset() override;
     void start() override;
     void stop() override;
@@ -266,7 +265,7 @@ int JackPlayback::process(jack_nframes_t numframes) noexcept
     if LIKELY(mPlaying.load(std::memory_order_acquire))
     {
         auto data = mRing->getReadVector();
-        jack_nframes_t todo{minu(numframes, static_cast<ALuint>(data.first.len))};
+        jack_nframes_t todo{minu(numframes, static_cast<uint>(data.first.len))};
         auto write_first = [&data,numchans,todo](float *outbuf) -> float*
         {
             const float *RESTRICT in = reinterpret_cast<float*>(data.first.buf);
@@ -283,7 +282,7 @@ int JackPlayback::process(jack_nframes_t numframes) noexcept
         std::transform(out.begin(), out.begin()+numchans, out.begin(), write_first);
         total += todo;
 
-        todo = minu(numframes-total, static_cast<ALuint>(data.second.len));
+        todo = minu(numframes-total, static_cast<uint>(data.second.len));
         if(todo > 0)
         {
             auto write_second = [&data,numchans,todo](float *outbuf) -> float*
@@ -334,11 +333,11 @@ int JackPlayback::mixerProc()
         }
 
         auto data = mRing->getWriteVector();
-        auto todo = static_cast<ALuint>(data.first.len + data.second.len);
+        size_t todo{data.first.len + data.second.len};
         todo -= todo%mDevice->UpdateSize;
 
-        ALuint len1{minu(static_cast<ALuint>(data.first.len), todo)};
-        ALuint len2{minu(static_cast<ALuint>(data.second.len), todo-len1)};
+        const auto len1 = static_cast<uint>(minz(data.first.len, todo));
+        const auto len2 = static_cast<uint>(minz(data.second.len, todo-len1));
 
         std::lock_guard<std::mutex> _{mMutex};
         mDevice->renderSamples(data.first.buf, len1, frame_step);
@@ -351,7 +350,7 @@ int JackPlayback::mixerProc()
 }
 
 
-void JackPlayback::open(const ALCchar *name)
+void JackPlayback::open(const char *name)
 {
     mPortPattern.clear();
 
@@ -366,7 +365,8 @@ void JackPlayback::open(const ALCchar *name)
         { return entry.mName == name; };
         auto iter = std::find_if(PlaybackList.cbegin(), PlaybackList.cend(), check_name);
         if(iter == PlaybackList.cend())
-            throw al::backend_exception{ALC_INVALID_VALUE, "Device name \"%s\" not found", name};
+            throw al::backend_exception{al::backend_error::NoDevice,
+                "Device name \"%s\" not found", name};
         mPortPattern = iter->mPattern;
     }
 
@@ -374,8 +374,8 @@ void JackPlayback::open(const ALCchar *name)
     jack_status_t status;
     mClient = jack_client_open(client_name, ClientOptions, &status, nullptr);
     if(mClient == nullptr)
-        throw al::backend_exception{ALC_INVALID_VALUE, "Failed to open client connection: 0x%02x",
-            status};
+        throw al::backend_exception{al::backend_error::DeviceError,
+            "Failed to open client connection: 0x%02x", status};
 
     if((status&JackServerStarted))
         TRACE("JACK server started\n");
@@ -405,7 +405,7 @@ bool JackPlayback::reset()
     mDevice->BufferSize = mDevice->UpdateSize * 2;
 
     const char *devname{mDevice->DeviceName.c_str()};
-    ALuint bufsize{ConfigValueUInt(devname, "jack", "buffer-size").value_or(mDevice->UpdateSize)};
+    uint bufsize{ConfigValueUInt(devname, "jack", "buffer-size").value_or(mDevice->UpdateSize)};
     bufsize = maxu(NextPowerOf2(bufsize), mDevice->UpdateSize);
     mDevice->BufferSize = bufsize + mDevice->UpdateSize;
 
@@ -448,7 +448,7 @@ bool JackPlayback::reset()
 void JackPlayback::start()
 {
     if(jack_activate(mClient))
-        throw al::backend_exception{ALC_INVALID_DEVICE, "Failed to activate client"};
+        throw al::backend_exception{al::backend_error::DeviceError, "Failed to activate client"};
 
     const char *devname{mDevice->DeviceName.c_str()};
     if(ConfigValueBool(devname, "jack", "connect-ports").value_or(true))
@@ -458,7 +458,8 @@ void JackPlayback::start()
         if(ports == nullptr)
         {
             jack_deactivate(mClient);
-            throw al::backend_exception{ALC_INVALID_DEVICE, "No physical playback ports found"};
+            throw al::backend_exception{al::backend_error::DeviceError,
+                "No physical playback ports found"};
         }
         auto connect_port = [this](const jack_port_t *port, const char *pname) -> bool
         {
@@ -485,7 +486,7 @@ void JackPlayback::start()
     mDevice->UpdateSize = jack_get_buffer_size(mClient);
     mDevice->BufferSize = mDevice->UpdateSize * 2;
 
-    ALuint bufsize{ConfigValueUInt(devname, "jack", "buffer-size").value_or(mDevice->UpdateSize)};
+    uint bufsize{ConfigValueUInt(devname, "jack", "buffer-size").value_or(mDevice->UpdateSize)};
     bufsize = maxu(NextPowerOf2(bufsize), mDevice->UpdateSize);
     mDevice->BufferSize = bufsize + mDevice->UpdateSize;
 
@@ -500,8 +501,8 @@ void JackPlayback::start()
     catch(std::exception& e) {
         jack_deactivate(mClient);
         mPlaying.store(false, std::memory_order_release);
-        throw al::backend_exception{ALC_INVALID_DEVICE, "Failed to start mixing thread: %s",
-            e.what()};
+        throw al::backend_exception{al::backend_error::DeviceError,
+            "Failed to start mixing thread: %s", e.what()};
     }
 }
 

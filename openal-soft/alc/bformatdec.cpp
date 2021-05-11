@@ -10,12 +10,10 @@
 #include <iterator>
 #include <numeric>
 
-#include "AL/al.h"
-
 #include "almalloc.h"
 #include "alu.h"
-#include "ambdec.h"
-#include "filters/splitter.h"
+#include "core/ambdec.h"
+#include "core/filters/splitter.h"
 #include "front_stablizer.h"
 #include "math_defs.h"
 #include "opthelpers.h"
@@ -23,55 +21,54 @@
 
 namespace {
 
-constexpr std::array<float,MAX_AMBI_ORDER+1> Ambi3DDecoderHFScale{{
+constexpr std::array<float,MaxAmbiOrder+1> Ambi3DDecoderHFScale{{
     1.00000000e+00f, 1.00000000e+00f
 }};
-constexpr std::array<float,MAX_AMBI_ORDER+1> Ambi3DDecoderHFScale2O{{
+constexpr std::array<float,MaxAmbiOrder+1> Ambi3DDecoderHFScale2O{{
     7.45355990e-01f, 1.00000000e+00f, 1.00000000e+00f
 }};
-constexpr std::array<float,MAX_AMBI_ORDER+1> Ambi3DDecoderHFScale3O{{
+constexpr std::array<float,MaxAmbiOrder+1> Ambi3DDecoderHFScale3O{{
     5.89792205e-01f, 8.79693856e-01f, 1.00000000e+00f, 1.00000000e+00f
 }};
 
-inline auto GetDecoderHFScales(ALuint order) noexcept -> const std::array<float,MAX_AMBI_ORDER+1>&
+inline auto& GetDecoderHFScales(uint order) noexcept
 {
     if(order >= 3) return Ambi3DDecoderHFScale3O;
     if(order == 2) return Ambi3DDecoderHFScale2O;
     return Ambi3DDecoderHFScale;
 }
 
-inline auto GetAmbiScales(AmbDecScale scaletype) noexcept
-    -> const std::array<float,MAX_AMBI_CHANNELS>&
+inline auto& GetAmbiScales(AmbDecScale scaletype) noexcept
 {
-    if(scaletype == AmbDecScale::FuMa) return AmbiScale::FromFuMa;
-    if(scaletype == AmbDecScale::SN3D) return AmbiScale::FromSN3D;
-    return AmbiScale::FromN3D;
+    if(scaletype == AmbDecScale::FuMa) return AmbiScale::FromFuMa();
+    if(scaletype == AmbDecScale::SN3D) return AmbiScale::FromSN3D();
+    return AmbiScale::FromN3D();
 }
 
 } // namespace
 
 
 BFormatDec::BFormatDec(const AmbDecConf *conf, const bool allow_2band, const size_t inchans,
-    const ALuint srate, const ALuint (&chanmap)[MAX_OUTPUT_CHANNELS],
+    const uint srate, const uint (&chanmap)[MAX_OUTPUT_CHANNELS],
     std::unique_ptr<FrontStablizer> stablizer)
     : mStablizer{std::move(stablizer)}, mDualBand{allow_2band && (conf->FreqBands == 2)}
     , mChannelDec{inchans}
 {
-    const bool periphonic{(conf->ChanMask&AMBI_PERIPHONIC_MASK) != 0};
-    const std::array<float,MAX_AMBI_CHANNELS> &coeff_scale = GetAmbiScales(conf->CoeffScale);
+    const bool periphonic{(conf->ChanMask&AmbiPeriphonicMask) != 0};
+    auto&& coeff_scale = GetAmbiScales(conf->CoeffScale);
 
     if(!mDualBand)
     {
         for(size_t j{0},k{0};j < mChannelDec.size();++j)
         {
-            const size_t acn{periphonic ? j : AmbiIndex::From2D[j]};
+            const size_t acn{periphonic ? j : AmbiIndex::FromACN2D()[j]};
             if(!(conf->ChanMask&(1u<<acn))) continue;
-            const size_t order{AmbiIndex::OrderFromChannel[acn]};
+            const size_t order{AmbiIndex::OrderFromChannel()[acn]};
             const float gain{conf->HFOrderGain[order] / coeff_scale[acn]};
-            for(size_t i{0u};i < conf->Speakers.size();++i)
+            for(size_t i{0u};i < conf->NumSpeakers;++i)
             {
                 const size_t chanidx{chanmap[i]};
-                mChannelDec[j].mGains.Single[chanidx] = conf->HFMatrix[i][k] * gain;
+                mChannelDec[j].mGains.Single[chanidx] = conf->Matrix[i][k] * gain;
             }
             ++k;
         }
@@ -85,12 +82,12 @@ BFormatDec::BFormatDec(const AmbDecConf *conf, const bool allow_2band, const siz
         const float ratio{std::pow(10.0f, conf->XOverRatio / 40.0f)};
         for(size_t j{0},k{0};j < mChannelDec.size();++j)
         {
-            const size_t acn{periphonic ? j : AmbiIndex::From2D[j]};
+            const size_t acn{periphonic ? j : AmbiIndex::FromACN2D()[j]};
             if(!(conf->ChanMask&(1u<<acn))) continue;
-            const size_t order{AmbiIndex::OrderFromChannel[acn]};
+            const size_t order{AmbiIndex::OrderFromChannel()[acn]};
             const float hfGain{conf->HFOrderGain[order] * ratio / coeff_scale[acn]};
             const float lfGain{conf->LFOrderGain[order] / ratio / coeff_scale[acn]};
-            for(size_t i{0u};i < conf->Speakers.size();++i)
+            for(size_t i{0u};i < conf->NumSpeakers;++i)
             {
                 const size_t chanidx{chanmap[i]};
                 mChannelDec[j].mGains.Dual[sHFBand][chanidx] = conf->HFMatrix[i][k] * hfGain;
@@ -269,10 +266,10 @@ void BFormatDec::processStablize(const al::span<FloatBufferLine> OutBuffer,
 }
 
 
-auto BFormatDec::GetHFOrderScales(const ALuint in_order, const ALuint out_order) noexcept
-    -> std::array<float,MAX_AMBI_ORDER+1>
+auto BFormatDec::GetHFOrderScales(const uint in_order, const uint out_order) noexcept
+    -> std::array<float,MaxAmbiOrder+1>
 {
-    std::array<float,MAX_AMBI_ORDER+1> ret{};
+    std::array<float,MaxAmbiOrder+1> ret{};
 
     assert(out_order >= in_order);
 
@@ -286,7 +283,7 @@ auto BFormatDec::GetHFOrderScales(const ALuint in_order, const ALuint out_order)
 }
 
 std::unique_ptr<BFormatDec> BFormatDec::Create(const AmbDecConf *conf, const bool allow_2band,
-    const size_t inchans, const ALuint srate, const ALuint (&chanmap)[MAX_OUTPUT_CHANNELS],
+    const size_t inchans, const uint srate, const uint (&chanmap)[MAX_OUTPUT_CHANNELS],
     std::unique_ptr<FrontStablizer> stablizer)
 {
     return std::unique_ptr<BFormatDec>{new(FamCount(inchans))

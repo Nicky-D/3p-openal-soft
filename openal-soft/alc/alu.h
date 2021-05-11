@@ -6,17 +6,17 @@
 #include <cstddef>
 #include <type_traits>
 
-#include "AL/al.h"
-
-#include "alcmain.h"
 #include "alspan.h"
+#include "core/ambidefs.h"
+#include "core/bufferline.h"
+#include "core/devformat.h"
 
 struct ALCcontext;
-struct ALbufferlistitem;
-struct ALeffectslot;
+struct ALCdevice;
+struct EffectSlot;
+struct MixParams;
 
 
-#define MAX_PITCH  10
 #define MAX_SENDS  6
 
 
@@ -29,31 +29,11 @@ extern MixerFunc MixSamples;
 
 constexpr float GainMixMax{1000.0f}; /* +60dB */
 
-constexpr float GainSilenceThreshold{0.00001f}; /* -100dB */
-
 constexpr float SpeedOfSoundMetersPerSec{343.3f};
 constexpr float AirAbsorbGainHF{0.99426f}; /* -0.05dB */
 
 /** Target gain for the reverb decay feedback reaching the decay time. */
 constexpr float ReverbDecayGain{0.001f}; /* -60 dB */
-
-
-constexpr int MixerFracBits{12};
-constexpr int MixerFracOne{1 << MixerFracBits};
-constexpr int MixerFracMask{MixerFracOne - 1};
-
-
-inline float lerp(float val1, float val2, float mu) noexcept
-{ return val1 + (val2-val1)*mu; }
-inline float cubic(float val1, float val2, float val3, float val4, float mu) noexcept
-{
-    const float mu2{mu*mu}, mu3{mu2*mu};
-    const float a0{-0.5f*mu3 +       mu2 + -0.5f*mu};
-    const float a1{ 1.5f*mu3 + -2.5f*mu2            + 1.0f};
-    const float a2{-1.5f*mu3 +  2.0f*mu2 +  0.5f*mu};
-    const float a3{ 0.5f*mu3 + -0.5f*mu2};
-    return val1*a0 + val2*a1 + val3*a2 + val4*a3;
-}
 
 
 enum HrtfRequestMode {
@@ -74,7 +54,7 @@ void aluInitMixer(void);
 void aluInitRenderer(ALCdevice *device, int hrtf_id, HrtfRequestMode hrtf_appreq,
     HrtfRequestMode hrtf_userreq);
 
-void aluInitEffectPanning(ALeffectslot *slot, ALCcontext *context);
+void aluInitEffectPanning(EffectSlot *slot, ALCcontext *context);
 
 /**
  * Calculates ambisonic encoder coefficients using the X, Y, and Z direction
@@ -90,7 +70,7 @@ void aluInitEffectPanning(ALeffectslot *slot, ALCcontext *context);
  * The components are ordered such that OpenAL's X, Y, and Z are the first,
  * second, and third parameters respectively -- simply negate X and Z.
  */
-std::array<float,MAX_AMBI_CHANNELS> CalcAmbiCoeffs(const float y, const float z, const float x,
+std::array<float,MaxAmbiChannels> CalcAmbiCoeffs(const float y, const float z, const float x,
     const float spread);
 
 /**
@@ -100,7 +80,7 @@ std::array<float,MAX_AMBI_CHANNELS> CalcAmbiCoeffs(const float y, const float z,
  * vector must be normalized (unit length), and the spread is the angular width
  * of the sound (0...tau).
  */
-inline std::array<float,MAX_AMBI_CHANNELS> CalcDirectionCoeffs(const float (&dir)[3],
+inline std::array<float,MaxAmbiChannels> CalcDirectionCoeffs(const float (&dir)[3],
     const float spread)
 {
     /* Convert from OpenAL coords to Ambisonics. */
@@ -114,7 +94,7 @@ inline std::array<float,MAX_AMBI_CHANNELS> CalcDirectionCoeffs(const float (&dir
  * azimuth and elevation parameters are in radians, going right and up
  * respectively.
  */
-inline std::array<float,MAX_AMBI_CHANNELS> CalcAngleCoeffs(const float azimuth,
+inline std::array<float,MaxAmbiChannels> CalcAngleCoeffs(const float azimuth,
     const float elevation, const float spread)
 {
     const float x{-std::sin(azimuth) * std::cos(elevation)};
@@ -143,7 +123,7 @@ auto SetAmbiPanIdentity(T iter, I count, F func) -> std::enable_if_t<std::is_int
 {
     if(count < 1) return;
 
-    std::array<float,MAX_AMBI_CHANNELS> coeffs{{1.0f}};
+    std::array<float,MaxAmbiChannels> coeffs{{1.0f}};
     func(*iter, coeffs);
     ++iter;
     for(I i{1};i < count;++i,++iter)

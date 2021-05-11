@@ -27,13 +27,10 @@
 #include <cstring>
 #include <string>
 
-#include "AL/al.h"
-
 #include "alcmain.h"
-#include "alexcpt.h"
 #include "almalloc.h"
 #include "alu.h"
-#include "logging.h"
+#include "core/logging.h"
 
 #include <SDL2/SDL.h>
 
@@ -46,7 +43,7 @@ namespace {
 #define DEVNAME_PREFIX ""
 #endif
 
-constexpr ALCchar defaultDeviceName[] = DEVNAME_PREFIX "Default Device";
+constexpr char defaultDeviceName[] = DEVNAME_PREFIX "Default Device";
 
 struct Sdl2Backend final : public BackendBase {
     Sdl2Backend(ALCdevice *device) noexcept : BackendBase{device} { }
@@ -56,18 +53,18 @@ struct Sdl2Backend final : public BackendBase {
     static void audioCallbackC(void *ptr, Uint8 *stream, int len) noexcept
     { static_cast<Sdl2Backend*>(ptr)->audioCallback(stream, len); }
 
-    void open(const ALCchar *name) override;
+    void open(const char *name) override;
     bool reset() override;
     void start() override;
     void stop() override;
 
     SDL_AudioDeviceID mDeviceID{0u};
-    ALuint mFrameSize{0};
+    uint mFrameSize{0};
 
-    ALuint mFrequency{0u};
+    uint mFrequency{0u};
     DevFmtChannels mFmtChans{};
     DevFmtType     mFmtType{};
-    ALuint mUpdateSize{0u};
+    uint mUpdateSize{0u};
 
     DEF_NEWDEL(Sdl2Backend)
 };
@@ -86,7 +83,7 @@ void Sdl2Backend::audioCallback(Uint8 *stream, int len) noexcept
     mDevice->renderSamples(stream, ulen / mFrameSize, mDevice->channelsFromFmt());
 }
 
-void Sdl2Backend::open(const ALCchar *name)
+void Sdl2Backend::open(const char *name)
 {
     SDL_AudioSpec want{}, have{};
 
@@ -123,17 +120,17 @@ void Sdl2Backend::open(const ALCchar *name)
                 SDL_AUDIO_ALLOW_ANY_CHANGE);
     }
     if(mDeviceID == 0)
-        throw al::backend_exception{ALC_INVALID_VALUE, "%s", SDL_GetError()};
+        throw al::backend_exception{al::backend_error::NoDevice, "%s", SDL_GetError()};
 
-    mDevice->Frequency = static_cast<ALuint>(have.freq);
+    mDevice->Frequency = static_cast<uint>(have.freq);
 
     if(have.channels == 1)
         mDevice->FmtChans = DevFmtMono;
     else if(have.channels == 2)
         mDevice->FmtChans = DevFmtStereo;
     else
-        throw al::backend_exception{ALC_INVALID_VALUE, "Unhandled SDL channel count: %d",
-            int{have.channels}};
+        throw al::backend_exception{al::backend_error::DeviceError,
+            "Unhandled SDL channel count: %d", int{have.channels}};
 
     switch(have.format)
     {
@@ -144,7 +141,7 @@ void Sdl2Backend::open(const ALCchar *name)
     case AUDIO_S32SYS: mDevice->FmtType = DevFmtInt;    break;
     case AUDIO_F32SYS: mDevice->FmtType = DevFmtFloat;  break;
     default:
-        throw al::backend_exception{ALC_INVALID_VALUE, "Unhandled SDL format: 0x%04x",
+        throw al::backend_exception{al::backend_error::DeviceError, "Unhandled SDL format: 0x%04x",
             have.format};
     }
     mDevice->UpdateSize = have.samples;

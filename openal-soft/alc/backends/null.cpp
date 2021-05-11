@@ -31,10 +31,8 @@
 #include <thread>
 
 #include "alcmain.h"
-#include "alexcpt.h"
 #include "almalloc.h"
 #include "alu.h"
-#include "logging.h"
 #include "threads.h"
 
 
@@ -44,7 +42,7 @@ using std::chrono::seconds;
 using std::chrono::milliseconds;
 using std::chrono::nanoseconds;
 
-constexpr ALCchar nullDevice[] = "No Output";
+constexpr char nullDevice[] = "No Output";
 
 
 struct NullBackend final : public BackendBase {
@@ -52,7 +50,7 @@ struct NullBackend final : public BackendBase {
 
     int mixerProc();
 
-    void open(const ALCchar *name) override;
+    void open(const char *name) override;
     bool reset() override;
     void start() override;
     void stop() override;
@@ -107,12 +105,13 @@ int NullBackend::mixerProc()
 }
 
 
-void NullBackend::open(const ALCchar *name)
+void NullBackend::open(const char *name)
 {
     if(!name)
         name = nullDevice;
     else if(strcmp(name, nullDevice) != 0)
-        throw al::backend_exception{ALC_INVALID_VALUE, "Device name \"%s\" not found", name};
+        throw al::backend_exception{al::backend_error::NoDevice, "Device name \"%s\" not found",
+            name};
 
     mDevice->DeviceName = name;
 }
@@ -130,8 +129,8 @@ void NullBackend::start()
         mThread = std::thread{std::mem_fn(&NullBackend::mixerProc), this};
     }
     catch(std::exception& e) {
-        throw al::backend_exception{ALC_INVALID_DEVICE, "Failed to start mixing thread: %s",
-            e.what()};
+        throw al::backend_exception{al::backend_error::DeviceError,
+            "Failed to start mixing thread: %s", e.what()};
     }
 }
 

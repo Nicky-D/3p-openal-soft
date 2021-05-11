@@ -22,10 +22,10 @@
 
 #include <cstdlib>
 
-#include "al/auxeffectslot.h"
 #include "alcmain.h"
 #include "alcontext.h"
 #include "alu.h"
+#include "effectslot.h"
 #include "vecmat.h"
 
 
@@ -40,7 +40,7 @@ namespace {
 
 struct CompressorState final : public EffectState {
     /* Effect gains for each channel */
-    float mGain[MAX_AMBI_CHANNELS][MAX_OUTPUT_CHANNELS]{};
+    float mGain[MaxAmbiChannels][MAX_OUTPUT_CHANNELS]{};
 
     /* Effect parameters */
     bool mEnabled{true};
@@ -49,14 +49,16 @@ struct CompressorState final : public EffectState {
     float mEnvFollower{1.0f};
 
 
-    void deviceUpdate(const ALCdevice *device) override;
-    void update(const ALCcontext *context, const ALeffectslot *slot, const EffectProps *props, const EffectTarget target) override;
-    void process(const size_t samplesToDo, const al::span<const FloatBufferLine> samplesIn, const al::span<FloatBufferLine> samplesOut) override;
+    void deviceUpdate(const ALCdevice *device, const Buffer &buffer) override;
+    void update(const ALCcontext *context, const EffectSlot *slot, const EffectProps *props,
+        const EffectTarget target) override;
+    void process(const size_t samplesToDo, const al::span<const FloatBufferLine> samplesIn,
+        const al::span<FloatBufferLine> samplesOut) override;
 
     DEF_NEWDEL(CompressorState)
 };
 
-void CompressorState::deviceUpdate(const ALCdevice *device)
+void CompressorState::deviceUpdate(const ALCdevice *device, const Buffer&)
 {
     /* Number of samples to do a full attack and release (non-integer sample
      * counts are okay).
@@ -71,17 +73,19 @@ void CompressorState::deviceUpdate(const ALCdevice *device)
     mReleaseMult = std::pow(AMP_ENVELOPE_MIN/AMP_ENVELOPE_MAX, 1.0f/releaseCount);
 }
 
-void CompressorState::update(const ALCcontext*, const ALeffectslot *slot, const EffectProps *props, const EffectTarget target)
+void CompressorState::update(const ALCcontext*, const EffectSlot *slot,
+    const EffectProps *props, const EffectTarget target)
 {
     mEnabled = props->Compressor.OnOff;
 
     mOutTarget = target.Main->Buffer;
-    auto set_gains = [slot,target](auto &gains, al::span<const float,MAX_AMBI_CHANNELS> coeffs)
-    { ComputePanGains(target.Main, coeffs.data(), slot->Params.Gain, gains); };
+    auto set_gains = [slot,target](auto &gains, al::span<const float,MaxAmbiChannels> coeffs)
+    { ComputePanGains(target.Main, coeffs.data(), slot->Gain, gains); };
     SetAmbiPanIdentity(std::begin(mGain), slot->Wet.Buffer.size(), set_gains);
 }
 
-void CompressorState::process(const size_t samplesToDo, const al::span<const FloatBufferLine> samplesIn, const al::span<FloatBufferLine> samplesOut)
+void CompressorState::process(const size_t samplesToDo,
+    const al::span<const FloatBufferLine> samplesIn, const al::span<FloatBufferLine> samplesOut)
 {
     for(size_t base{0u};base < samplesToDo;)
     {
@@ -150,69 +154,10 @@ void CompressorState::process(const size_t samplesToDo, const al::span<const Flo
 }
 
 
-void Compressor_setParami(EffectProps *props, ALenum param, int val)
-{
-    switch(param)
-    {
-    case AL_COMPRESSOR_ONOFF:
-        if(!(val >= AL_COMPRESSOR_MIN_ONOFF && val <= AL_COMPRESSOR_MAX_ONOFF))
-            throw effect_exception{AL_INVALID_VALUE, "Compressor state out of range"};
-        props->Compressor.OnOff = (val != AL_FALSE);
-        break;
-
-    default:
-        throw effect_exception{AL_INVALID_ENUM, "Invalid compressor integer property 0x%04x",
-            param};
-    }
-}
-void Compressor_setParamiv(EffectProps *props, ALenum param, const int *vals)
-{ Compressor_setParami(props, param, vals[0]); }
-void Compressor_setParamf(EffectProps*, ALenum param, float)
-{ throw effect_exception{AL_INVALID_ENUM, "Invalid compressor float property 0x%04x", param}; }
-void Compressor_setParamfv(EffectProps*, ALenum param, const float*)
-{
-    throw effect_exception{AL_INVALID_ENUM, "Invalid compressor float-vector property 0x%04x",
-        param};
-}
-
-void Compressor_getParami(const EffectProps *props, ALenum param, int *val)
-{ 
-    switch(param)
-    {
-    case AL_COMPRESSOR_ONOFF:
-        *val = props->Compressor.OnOff;
-        break;
-
-    default:
-        throw effect_exception{AL_INVALID_ENUM, "Invalid compressor integer property 0x%04x",
-            param};
-    }
-}
-void Compressor_getParamiv(const EffectProps *props, ALenum param, int *vals)
-{ Compressor_getParami(props, param, vals); }
-void Compressor_getParamf(const EffectProps*, ALenum param, float*)
-{ throw effect_exception{AL_INVALID_ENUM, "Invalid compressor float property 0x%04x", param}; }
-void Compressor_getParamfv(const EffectProps*, ALenum param, float*)
-{
-    throw effect_exception{AL_INVALID_ENUM, "Invalid compressor float-vector property 0x%04x",
-        param};
-}
-
-DEFINE_ALEFFECT_VTABLE(Compressor);
-
-
 struct CompressorStateFactory final : public EffectStateFactory {
-    EffectState *create() override { return new CompressorState{}; }
-    EffectProps getDefaultProps() const noexcept override;
-    const EffectVtable *getEffectVtable() const noexcept override { return &Compressor_vtable; }
+    al::intrusive_ptr<EffectState> create() override
+    { return al::intrusive_ptr<EffectState>{new CompressorState{}}; }
 };
-
-EffectProps CompressorStateFactory::getDefaultProps() const noexcept
-{
-    EffectProps props{};
-    props.Compressor.OnOff = AL_COMPRESSOR_DEFAULT_ONOFF;
-    return props;
-}
 
 } // namespace
 
