@@ -269,13 +269,13 @@ pushd "$top/openal-soft"
 
             # create debug bundles
             pushd "${stage}/lib/debug"
-                fix_dylib_id "libopenal.dylib"
+                install_name_tool -id "@rpath/libopenal.dylib" "libopenal.dylib"
                 dsymutil libopenal.dylib
                 strip -x -S libopenal.dylib
             popd
 
             pushd "${stage}/lib/release"
-                fix_dylib_id "libopenal.dylib"
+                install_name_tool -id "@rpath/libopenal.dylib" "libopenal.dylib"
                 dsymutil libopenal.dylib
                 strip -x -S libopenal.dylib
             popd
