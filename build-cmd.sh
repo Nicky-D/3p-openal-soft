@@ -563,13 +563,13 @@ pushd "$top/freealut"
 
             # create debug bundles
             pushd "${stage}/lib/debug"
-                fix_dylib_id "libalut.dylib"
+                install_name_tool -id "@rpath/libalut.dylib" "libalut.dylib"
                 dsymutil libalut.dylib
                 strip -x -S libalut.dylib
             popd
 
             pushd "${stage}/lib/release"
-                fix_dylib_id "libalut.dylib"
+                install_name_tool -id "@rpath/libalut.dylib" "libalut.dylib"
                 dsymutil libalut.dylib
                 strip -x -S libalut.dylib
             popd
