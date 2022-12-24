@@ -576,6 +576,26 @@ pushd "$top/freealut"
 
             # copy includes
             cp -a $stage/alut_release_arm64/include/AL/* $stage/include/AL/
+
+            if [ -n "${APPLE_SIGNATURE:=""}" -a -n "${APPLE_KEY:=""}" -a -n "${APPLE_KEYCHAIN:=""}" ]; then
+                KEYCHAIN_PATH="$HOME/Library/Keychains/$APPLE_KEYCHAIN"
+                security unlock-keychain -p $APPLE_KEY $KEYCHAIN_PATH
+                for dylib in $stage/lib/*/libopenal*.dylib;
+                do
+                    if [ -f "$dylib" ]; then
+                        codesign --keychain "$KEYCHAIN_PATH" --sign "$APPLE_SIGNATURE" --force --timestamp "$dylib" || true
+                    fi
+                done
+                for dylib in $stage/lib/*/libalut*.dylib;
+                do
+                    if [ -f "$dylib" ]; then
+                        codesign --keychain "$KEYCHAIN_PATH" --sign "$APPLE_SIGNATURE" --force --timestamp "$dylib" || true
+                    fi
+                done
+                security lock-keychain $KEYCHAIN_PATH
+            else
+                echo "Code signing not configured; skipping codesign."
+            fi
         ;;
         linux*)
             # Linux build environment at Linden comes pre-polluted with stuff that can
